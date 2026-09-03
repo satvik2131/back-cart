@@ -39,12 +39,13 @@ async def checkout(
         alias="Idempotency-Key",
         description="Client-generated key; reuse it verbatim on retry.",
     ),
-    _body: CheckoutRequest | None = None,
+    body_in: CheckoutRequest | None = None,
     session: AsyncSession = Depends(get_session),
 ) -> JSONResponse:
+    coupon_code = body_in.coupon_code if body_in else None
     try:
         body, status_code = await service.checkout(
-            session, cart_id, idempotency_key
+            session, cart_id, idempotency_key, coupon_code
         )
         await session.commit()
     except Exception:

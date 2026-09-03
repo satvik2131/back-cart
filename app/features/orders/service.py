@@ -31,6 +31,7 @@ from app.core.errors import (
     NotFoundError,
 )
 from app.features.carts.models import Cart, CartItem, CartStatus
+from app.features.coupons import service as coupons_service
 from app.features.orders.models import IdempotencyKey, Order, OrderItem, OrderStatus
 from app.features.orders.schemas import OrderItemRead, OrderRead
 from app.features.products.models import Product
@@ -93,7 +94,10 @@ async def _cart_items_with_products(
 
 
 async def checkout(
-    session: AsyncSession, cart_id: uuid.UUID, idempotency_key: str
+    session: AsyncSession,
+    cart_id: uuid.UUID,
+    idempotency_key: str,
+    coupon_code: str | None = None,
 ) -> CheckoutResult:
     # Fast path: this key was already processed — return the stored response
     # verbatim without touching the cart.
@@ -155,13 +159,23 @@ async def checkout(
             )
 
     # (c-e) Totals from the CURRENT product price (matches the Carts module's
-    # "cart items hold no price" decision). Discount is Phase 2.
+    # "cart items hold no price" decision).
     gross_total_cents = sum(
         product.unit_price_cents * cart_item.quantity
         for cart_item, product in rows
     )
+
+    # Coupon validation + discount quote happen AFTER inventory has succeeded,
+    # so a checkout doomed by stock never touches a coupon (invariant 6). No
+    # coupon state is changed yet — only quoted.
+    coupon = None
     discount_cents = 0
-    net_total_cents = gross_total_cents - discount_cents
+    if coupon_code:
+        coupon, discount_cents = await coupons_service.quote_discount(
+            session, coupon_code, gross_total_cents
+        )
+
+    net_total_cents = max(0, gross_total_cents - discount_cents)
 
     # (f) Order + fully snapshotted items.
     order = Order(
@@ -173,6 +187,12 @@ async def checkout(
     )
     session.add(order)
     await session.flush()
+
+    # Now the order id exists: atomically redeem the coupon against it. If a
+    # parallel checkout won the race, this raises and the whole transaction —
+    # including the inventory decrements above — rolls back.
+    if coupon is not None:
+        await coupons_service.mark_redeemed(session, coupon, order.id)
 
     order_items = [
         OrderItem(
