@@ -113,6 +113,18 @@ clean up after themselves. At least one concurrency test per critical path
 (oversell, idempotent-retry race, concurrent coupon generation, concurrent
 coupon redemption), each verified to fail when its DB-level guard is removed.
 
+## Frontend demo (optional)
+
+A small React + Vite app under [`frontend/`](frontend/) drives the whole flow
+from a browser (products → cart → checkout → idempotent retry → coupons →
+report), showing real backend responses and errors. With the API running:
+
+```bash
+cd frontend && npm install && npm run dev   # http://localhost:5173
+```
+
+See [`frontend/README.md`](frontend/README.md).
+
 ## Inspecting the database (optional)
 
 ```bash
