@@ -13,7 +13,13 @@ services:
     # (Changing requirements*.txt still needs `docker compose up --build`.)
     volumes:
       - .:/app
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app
+    # Apply migrations and seed the catalogue on start, then serve — so a bare
+    # `docker compose up --build` yields a working, populated API. Both steps
+    # are idempotent.
+    command: >
+      sh -c "alembic upgrade head &&
+             python -m app.features.products.seed &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app"
 
   db:
     image: postgres:16
