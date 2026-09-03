@@ -1,5 +1,33 @@
 # DECISIONS.md
 
+## 0. Summary
+
+An async FastAPI + PostgreSQL backend for an ecommerce checkout and rewards
+service. The design goal throughout was **correctness under concurrency,
+retries, and partial failure** rather than feature breadth.
+
+**What's built:** products (read-only catalogue + seed), carts (create / view /
+add / update / remove, live-computed totals), checkout (idempotent, single
+transaction, atomic inventory decrement, immutable snapshotted orders), coupons
+(milestone generation guarded by a unique constraint; redemption wired into the
+checkout transaction), and a live admin report. 51 tests, including 5 that fire
+genuinely concurrent requests (`asyncio.gather`) and assert an invariant held —
+each verified to fail when its guard is removed.
+
+**Where correctness comes from:** the database. Every concurrency guarantee is a
+row lock (`SELECT ... FOR UPDATE`), a unique constraint, an atomic conditional
+`UPDATE ... WHERE ...` with a rows-affected check, or a CHECK constraint — never
+an in-process lock. The design stays correct run as N app instances against one
+database.
+
+**Effort:** roughly a focused day, built in an AI-pair-programmed session
+(see §9), phase by phase: scaffold → products → carts → checkout/orders →
+coupons → admin report → polish, with the test suite green and a commit series
+at each phase boundary.
+
+**Not built (see §7):** product write/restock API, a payment-failure
+abstraction, auth, pagination, structured request logging — each deferred with a
+reason.
 
 ---
 
@@ -670,6 +698,14 @@ future work.
 | `COUPON_ALREADY_REDEEMED` | 409 | Coupon was already spent |
 | `MILESTONE_NOT_REACHED` | 422 | Admin requested coupon gen before milestone hit |
 | `MILESTONE_ALREADY_REWARDED` | 409 | Coupon already generated for this milestone |
+| `METHOD_NOT_ALLOWED` | 405 | Wrong HTTP method for the route |
+| `DB_UNAVAILABLE` | 503 | `/health/db` connectivity probe failed |
+| `INTERNAL_ERROR` | 500 | Unexpected server error (logged; no detail leaked) |
+
+Framework-raised errors (unmatched route, wrong method, malformed path param)
+are wrapped in the same envelope by shared handlers in `app/core/errors.py`, so
+**every** error response — from a business rule or from FastAPI itself — has this
+shape.
 
 ---
 
@@ -767,22 +803,31 @@ future work.
 > Explain what changes if you go from one app instance + one DB to N
 > instances behind a load balancer.
 
-_e.g.:_
-- Row-level locking and unique constraints already live in Postgres, so
-  they continue to work correctly across multiple app instances without
-  modification — the DB is the single source of truth for concurrency
-  control, not in-process memory.
-- If an in-memory idempotency cache or mutex were used instead of DB-backed
-  ones, this would break under multiple instances; confirm your
-  implementation avoids this (or flag it if it doesn't).
-- Connection pooling (e.g., PgBouncer) becomes relevant at higher instance
-  counts to avoid exhausting Postgres connections.
-- Read-heavy endpoints (report, product listing) become candidates for a
-  read replica or cache (e.g., Redis) once write/read ratios justify it —
-  not necessary at this scale.
-- Migrations (Alembic) need a deployment strategy that ensures schema
-  changes are applied before new instances start serving traffic (e.g., a
-  migration job/init container ahead of the rolling deploy).
+- **Nothing changes for correctness.** Every concurrency guard is in Postgres:
+  the `FOR UPDATE` cart lock, the `products.inventory >= qty` conditional
+  update, the `coupons.milestone_number` / `code` unique constraints, the
+  `coupons.status = 'available'` conditional update, the `idempotency_keys` PK,
+  and the invariant-7 CHECK constraints. All of these are evaluated by the
+  database under its own locking, so they hold identically whether one app
+  process or fifty are talking to the one database.
+- **No in-process state is load-bearing.** There is no in-memory idempotency
+  cache, no `asyncio.Lock`, no module-level mutable state used for correctness —
+  a grep for `Lock(`/`Semaphore(` in `app/` turns up nothing. The idempotency
+  record is a table row, not a dict.
+- **Connection pooling** (PgBouncer) becomes relevant at higher instance counts
+  so N app pools don't exhaust `max_connections`. The app already sets
+  `pool_pre_ping=True`.
+- **Read scaling:** `GET /products` and `GET /admin/report` are pure reads and
+  could move to a read replica once the write/read ratio justifies it. Not
+  needed at this scale.
+- **Migrations:** a rolling deploy needs `alembic upgrade head` to run (as a
+  job / init container) before new instances serve traffic, and migrations kept
+  backward-compatible for the window where both versions run.
+- **The one thing to watch:** long-held row locks. The checkout transaction
+  holds the cart-row lock and the affected product-row locks for its whole
+  duration. That's sub-millisecond today; if a real (slow) payment call were
+  added it would need to move outside the DB transaction with its own
+  idempotency, so it doesn't serialise every checkout of the same products.
 
 ---
 
@@ -791,24 +836,45 @@ _e.g.:_
 > Required. Be specific and honest — a concrete correction example is worth
 > more than a generic "AI helped me write code faster" statement.
 
-- **Tools used:** _e.g. Claude for scaffolding, design discussion, and
-  reviewing my concurrency approach._
-- **What AI got right / accelerated:** _e.g. Boilerplate FastAPI/Docker
-  scaffolding, Alembic setup, first-draft test structure._
-- **Example of correcting/rejecting AI output:** _e.g. "AI's first draft of
-  the checkout transaction used optimistic concurrency with a version
-  column and a retry loop on conflict. I rejected this because it adds
-  client-visible retry complexity and doesn't compose cleanly with the
-  idempotency-key mechanism; I replaced it with an atomic conditional
-  UPDATE inside the same transaction as the idempotency check, which is
-  simpler to reason about and doesn't require the client to ever see a
-  'try again' response for a problem the server can just solve
-  atomically."_
-- **Example 2 (if applicable):** _e.g. AI's first draft of coupon
-  redemption redeemed the coupon before validating inventory, which meant
-  a failed checkout due to inventory would still burn the coupon — caught
-  this while reviewing the invariant list and reordered the transaction
-  steps._
+- **Tools used:** Claude Code (Anthropic) as a pair-programmer for the whole
+  build — scaffolding, model/endpoint drafts, first-pass tests, and DECISIONS
+  prose — with every diff reviewed against the invariant list and the house
+  rules before committing, phase by phase.
+- **What AI accelerated:** the Docker/Compose/Alembic scaffold, the repetitive
+  shape of each feature module (model → schema → service → router → tests), the
+  migration boilerplate, and turning a verbal concurrency argument into a
+  running `asyncio.gather` regression test.
+
+- **Correction 1 — enum storage (subtle, caught in review).** The first
+  `Cart.status` model used `Enum(CartStatus, name="cart_status")` with
+  `server_default="open"`. SQLAlchemy, given a Python enum, stores the member
+  **name** (`OPEN`), not the value (`open`) — so the generated `CREATE TYPE`
+  would have had labels `OPEN`/`CHECKED_OUT` while the server default was the
+  string `open`, and inserts would have failed. Fixed by adding
+  `values_callable=lambda e: [m.value for m in e]` to every enum column and
+  regenerating the migration. Verified against the live `\dT+ cart_status`.
+
+- **Correction 2 — test isolation had a bad side effect.** The AI's first
+  concurrency-test setup ran committing requests against the app's configured
+  database and cleaned up with `DELETE`. Running the suite wiped the dev
+  catalogue (and a `RESTRICT` FK from `order_items` made the cleanup itself
+  fail after a manual smoke test). Redesigned: `conftest.py` now provisions a
+  dedicated `<db>_test` database from ORM metadata; the dev database is never
+  touched.
+
+- **Correction 3 — concurrency test that didn't actually test concurrency.**
+  An early version asserted `[201, 409]` but, on inspection, the two requests
+  were being awaited sequentially. Rewrote them to fire through one
+  `asyncio.gather`, and — as a standing check — deliberately replaced the
+  atomic `UPDATE ... WHERE inventory >= qty` with a naive read-then-write and
+  confirmed the test then fails (both checkouts succeed, overselling). The
+  same break-it check is documented for the idempotency and coupon guards.
+
+- **Correction 4 — ORM lifecycle in failure-path tests.** Several tests
+  accessed an ORM object (`widget.id`) *after* the checkout endpoint had
+  called `session.rollback()` on the shared test session, which expires
+  attributes and triggered a sync lazy-load (`MissingGreenlet`). Fixed by
+  capturing scalar ids before the call rather than re-reading through the ORM.
 
 ---
 
@@ -816,11 +882,25 @@ _e.g.:_
 
 > Shows you know your own gaps.
 
-1. _e.g. Load-test the inventory decrement under higher concurrency (50+
-   simultaneous requests) rather than the small N used in current tests, to
-   surface any lock-contention or deadlock behavior under Postgres._
-2. _e.g. Add pagination and filtering to the admin report and order-listing
-   endpoints._
-3. _e.g. Replace the fake payment abstraction with a slightly richer
-   interface (e.g., simulate a payment failure rate) to exercise the "order
-   creation succeeds but payment fails" rollback path more thoroughly._
+1. **Structured request logging** (the one house-rule gap). A JSON formatter, a
+   request-id middleware, and one structured event per mutation
+   (checkout / cart change / coupon generation) keyed by the idempotency /
+   correlation id, at `INFO` for business outcomes and `ERROR` for the
+   unexpected. The `_unhandled_exception_handler` already logs 500s; this
+   extends it to the success and expected-failure paths.
+2. **Higher-concurrency soak.** Current concurrency tests use N = 2–15. I'd run
+   50–100 simultaneous checkouts against a small inventory and a shared coupon
+   to watch for lock contention and, specifically, deadlocks between the cart
+   lock and multiple product-row locks (decrements are already ordered by
+   product name to avoid the classic ABBA case, but I'd want to see it under
+   load, not just argue it).
+3. **Idempotency-key retention.** Keys are stored forever. I'd add a
+   `created_at`-based TTL sweep (a periodic job) and decide the retention window
+   from realistic client retry behaviour.
+4. **Report grouping under product renames.** `quantity_sold_by_product` groups
+   by `(product_id, product_name_snapshot)`, so a product renamed mid-history
+   shows as two rows. I'd decide whether to group by `product_id` alone and
+   join `products` for the current name, and add a test for that case.
+5. **Payment abstraction with a simulated failure rate**, to exercise a
+   persisted `FAILED` order path and confirm the rollback story holds when the
+   failure is *after* inventory and coupon have been touched.

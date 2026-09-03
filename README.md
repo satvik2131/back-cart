@@ -1,18 +1,20 @@
 # back-cart
 
-Backend for an ecommerce checkout and rewards service. See DECISIONS.md for
-invariants and design decisions. Current state: scaffolding, the Products
-module (read-only catalogue), and the Carts module (carts + cart items, up to
-but not including checkout).
+Backend for an ecommerce **checkout and rewards** service: products with
+inventory, carts, one-shot idempotent checkout that produces immutable orders, a
+milestone-based coupon reward, and a live admin report.
+
+The design goal is **correctness under concurrency, retries, and partial
+failure** — not feature breadth. Every concurrency guarantee comes from the
+database (row locks, unique constraints, atomic conditional updates, CHECK
+constraints), so the service stays correct run as multiple instances against one
+database. See [`DECISIONS.md`](DECISIONS.md) for the invariants, the
+ambiguities resolved, and the material design decisions.
 
 ## Stack
 
-- FastAPI + Uvicorn
-- SQLAlchemy 2.x (async) + asyncpg
-- Alembic (async migrations)
-- pydantic-settings for configuration
-- PostgreSQL 16
-- Docker + docker compose
+FastAPI · SQLAlchemy 2 (async) + asyncpg · Alembic · PostgreSQL 16 ·
+pydantic-settings · pytest + httpx · Docker Compose
 
 ## Prerequisites
 
@@ -25,115 +27,139 @@ cp .env.example .env
 docker compose up --build
 ```
 
-The API is then reachable at http://localhost:8000.
-
-> The Postgres container publishes on host port **5434** (`localhost:5434`) to
-> avoid clashing with a local Postgres on 5432. Inside the compose network the
-> `api` service still reaches it as `db:5432`.
-
-## Health checks
+That's the only manual step. On start the `api` container runs
+`alembic upgrade head`, seeds the product catalogue (both idempotent), then
+serves on **http://localhost:8000**.
 
 ```bash
-curl localhost:8000/health
-# {"status":"ok"}
-
-curl localhost:8000/health/db
-# {"status":"ok","db":"connected"}
+curl localhost:8000/health         # {"status":"ok"}
+curl localhost:8000/health/db      # {"status":"ok","db":"connected"}
 ```
 
-Or open http://localhost:8000/docs.
+Interactive API docs: **http://localhost:8000/docs**
+
+> Postgres publishes on host port **5434** (to avoid clashing with a local
+> Postgres on 5432); inside the compose network it's `db:5432`.
+
+## API overview
+
+All money is **integer minor units (cents)**. All errors use one envelope:
+`{"error": {"code", "message", "details"}}` with stable codes (catalogued in
+[`DECISIONS.md` §6](DECISIONS.md)).
+
+| Method & path | Purpose |
+| --- | --- |
+| `GET /products` | List the seeded catalogue |
+| `GET /products/{id}` | One product (404 envelope on miss) |
+| `POST /carts` | Create an empty `open` cart |
+| `GET /carts/{id}` | Cart with line subtotals + total, computed live |
+| `POST /carts/{id}/items` | Add a product (or increment its quantity) |
+| `PATCH /carts/{id}/items/{item_id}` | Set quantity (`0` removes the line) |
+| `DELETE /carts/{id}/items/{item_id}` | Remove a line |
+| `POST /carts/{id}/checkout` | **Idempotent checkout.** Requires header `Idempotency-Key`. Optional body `{"coupon_code": "..."}`. One transaction: atomic inventory decrement → order + price snapshots → coupon redemption → cart closed. Retrying the same key replays the stored response. |
+| `GET /orders/{id}` | An order — snapshots only, never re-derived |
+| `POST /admin/coupons/generate` | *(admin)* Generate the coupon for the latest reached milestone |
+| `GET /admin/report` | *(admin)* Live revenue / discount / order / coupon / per-product totals — read-only |
+
+Admin endpoints are unauthenticated (per spec) but namespaced under `/admin` and
+tagged `admin` in the OpenAPI docs.
+
+### A full demo flow
+
+```bash
+cp .env.example .env && docker compose up --build -d && sleep 8
+
+BASE=localhost:8000
+PID=$(curl -s $BASE/products | python3 -c "import sys,json;print(next(p['id'] for p in json.load(sys.stdin) if p['inventory']>10))")
+
+CART=$(curl -s -X POST $BASE/carts | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
+curl -s -X POST $BASE/carts/$CART/items -H 'content-type: application/json' \
+  -d "{\"product_id\":\"$PID\",\"quantity\":2}"
+curl -s -X POST $BASE/carts/$CART/checkout -H 'Idempotency-Key: demo-1'
+curl -s -X POST $BASE/carts/$CART/checkout -H 'Idempotency-Key: demo-1'   # same order, no double effect
+curl -s $BASE/admin/report
+```
 
 ## Migrations
 
-Alembic is configured for async and reads `DATABASE_URL` from the same settings
-as the app.
-
-Run inside the running `api` container:
+Applied automatically on container start. Manually:
 
 ```bash
-# Apply migrations
 docker compose exec api alembic upgrade head
-
-# Create a new migration after changing models
-docker compose exec api alembic revision --autogenerate -m "add something"
-docker compose exec api alembic upgrade head
+docker compose exec api alembic revision --autogenerate -m "describe change"   # after model changes
 ```
 
-(Equivalent Make targets: `make migrate`, `make revision m="..."`.)
+Every schema change ships with its migration in the same commit; every migration
+has a working `downgrade()`. Make targets: `make migrate`, `make revision m="..."`.
 
 ## Seed data
 
-The product catalogue is inserted by an idempotent script (not a migration —
-see DECISIONS.md §3). After `alembic upgrade head`:
+Run automatically on start. Manually: `docker compose exec api python -m app.features.products.seed`
+(or `make seed`). Idempotent — inserts 6 products, including one at 2 units and
+one at 0 units so oversell / out-of-stock paths can be exercised. It is a script,
+not a data migration ([`DECISIONS.md` §3](DECISIONS.md)).
+
+## Tests
 
 ```bash
-docker compose exec api python -m app.features.products.seed   # or: make seed
+docker compose exec api pytest        # or: make test
 ```
 
-It adds 6 products, including one low-inventory (2 units) and one out-of-stock
-(0 units) for later oversell / out-of-stock testing.
+51 tests. The suite provisions and uses a **separate `back_cart_test`
+database** (schema built from the ORM metadata) — it never touches dev data.
+Sequential tests run inside a rolled-back transaction; concurrency tests
+(`asyncio.gather`, real parallel requests) run against real committed rows and
+clean up after themselves. At least one concurrency test per critical path
+(oversell, idempotent-retry race, concurrent coupon generation, concurrent
+coupon redemption), each verified to fail when its DB-level guard is removed.
 
 ## Inspecting the database (optional)
-
-`psql` is always available:
 
 ```bash
 docker compose exec db psql -U postgres -d back_cart -c "\dt"
 ```
 
-For a UI, an opt-in pgAdmin lives behind the `tools` compose profile, so the
-default `docker compose up` never starts it:
+An opt-in pgAdmin lives behind the `tools` profile (not started by default):
 
 ```bash
-docker compose --profile tools up -d pgadmin   # or: make pgadmin
+docker compose --profile tools up -d pgadmin      # or: make pgadmin
 ```
 
-Open http://localhost:5051 (desktop mode — no pgAdmin login; if prompted,
-`admin@example.com` / `admin`). The **back-cart** server is pre-registered;
-enter the database password `postgres` on first connect. Stop it with
-`docker compose --profile tools down`.
-
-## Tests
-
-```bash
-docker compose exec api pytest
-```
-
-Each test runs in a transaction that is rolled back on teardown, so the suite
-needs the schema applied (`alembic upgrade head`) but not the seed script.
+http://localhost:5051 — desktop mode, no login (if prompted: `admin@example.com`
+/ `admin`); the **back-cart** server is pre-registered, DB password `postgres`.
 
 ## Project layout
 
 ```
 app/
-  main.py                  FastAPI app + /health and /health/db + router wiring
-  core/config.py           pydantic-settings configuration
-  core/errors.py           structured error envelope + shared exception handlers
-  db/base.py               declarative Base
-  db/session.py            async engine + session factory + get_session dependency
-  api/router.py            empty aggregate router placeholder
-  features/
-    products/              catalogue (read-only)
-      models.py schemas.py service.py dependencies.py router.py seed.py
-    carts/                 carts + cart items (pre-checkout)
-      models.py            Cart (native status enum) + CartItem (unique
-                           cart_id+product_id, quantity>0 CHECK, no price)
-      schemas.py service.py dependencies.py router.py
-alembic/versions/          migrations
-tests/                     transaction-rollback + committing-client fixtures,
-                           feature tests (incl. a real-concurrency cart test)
+  main.py                    app construction, router wiring, /health
+  core/
+    config.py                pydantic-settings (DB URL, coupon config)
+    errors.py                error envelope + all exception handlers
+  db/
+    base.py  session.py      declarative Base; async engine + get_session
+  features/<name>/            one self-contained module per domain
+    models.py  schemas.py  service.py  dependencies.py  router.py
+    products/   read-only catalogue + seed.py
+    carts/      cart lifecycle, live totals, cart-row lock on mutations
+    orders/     checkout transaction + idempotency + GET /orders/{id}
+    coupons/    Coupon model + redemption (called from the checkout txn)
+    admin/      /admin/coupons/generate + /admin/report (no tables of its own)
+alembic/versions/            migrations (one per feature)
+tests/
+  conftest.py                test-DB provisioning, the two client fixtures
+  features/                   one test module per feature
+DECISIONS.md                 invariants, ambiguities, decisions, scaling, AI usage
 ```
 
 ## Make targets
 
 | Target | Action |
 | --- | --- |
-| `make up` | `docker compose up --build` |
-| `make down` | stop and remove containers |
+| `make up` / `make down` | start (build) / stop the stack |
 | `make logs` | tail the api logs |
-| `make migrate` | `alembic upgrade head` in the container |
-| `make revision m="..."` | autogenerate a migration |
-| `make seed` | insert the product catalogue (idempotent) |
+| `make migrate` / `make revision m="..."` | apply / create a migration |
+| `make seed` | re-seed the catalogue |
+| `make test` | run pytest |
 | `make pgadmin` | start the optional pgAdmin UI on :5051 |
-| `make test` | run pytest in the container |
 | `make shell` | shell into the api container |
