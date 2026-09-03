@@ -67,6 +67,21 @@ class ValidationError(AppError):
     status_code = status.HTTP_422_UNPROCESSABLE_ENTITY
 
 
+class ConflictError(AppError):
+    """A request that is well-formed but conflicts with current state (409)."""
+
+    code = "CONFLICT"
+    status_code = status.HTTP_409_CONFLICT
+
+
+class CartAlreadyCheckedOutError(ConflictError):
+    code = "CART_ALREADY_CHECKED_OUT"
+
+
+class InsufficientInventoryError(ConflictError):
+    code = "INSUFFICIENT_INVENTORY"
+
+
 def _envelope(code: str, message: str, details: dict[str, Any]) -> dict[str, Any]:
     return {"error": {"code": code, "message": message, "details": details}}
 
