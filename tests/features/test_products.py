@@ -5,6 +5,8 @@ import pytest_asyncio
 from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.features.carts.models import Cart, CartItem
+from app.features.orders.models import IdempotencyKey, Order, OrderItem
 from app.features.products.models import Product
 
 pytestmark = pytest.mark.asyncio
@@ -14,11 +16,12 @@ pytestmark = pytest.mark.asyncio
 async def seeded_products(db_session: AsyncSession) -> list[Product]:
     """A deterministic catalogue for the duration of one test.
 
-    Clears ``products`` first (inside the test's rolled-back transaction, so
-    committed data is untouched afterwards) and inserts a known set, letting
-    tests assert on exact contents and counts.
+    Clears the order/cart/product tables first (inside the test's rolled-back
+    transaction, so committed data is untouched afterwards) and inserts a known
+    set, letting tests assert on exact contents and counts.
     """
-    await db_session.execute(delete(Product))
+    for model in (OrderItem, Order, IdempotencyKey, CartItem, Cart, Product):
+        await db_session.execute(delete(model))
     products = [
         Product(name="Alpha Mug", unit_price_cents=1200, inventory=100),
         Product(name="Bravo Bottle", unit_price_cents=2500, inventory=5),

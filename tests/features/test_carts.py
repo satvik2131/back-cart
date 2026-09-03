@@ -7,6 +7,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.features.carts.models import Cart, CartItem, CartStatus
+from app.features.orders.models import IdempotencyKey, Order, OrderItem
 from app.features.products.models import Product
 
 pytestmark = pytest.mark.asyncio
@@ -15,9 +16,8 @@ pytestmark = pytest.mark.asyncio
 @pytest_asyncio.fixture
 async def products(db_session: AsyncSession) -> dict[str, Product]:
     """A small known catalogue for the duration of one test."""
-    await db_session.execute(delete(CartItem))
-    await db_session.execute(delete(Cart))
-    await db_session.execute(delete(Product))
+    for model in (OrderItem, Order, IdempotencyKey, CartItem, Cart, Product):
+        await db_session.execute(delete(model))
     catalogue = {
         "mug": Product(name="Mug", unit_price_cents=1200, inventory=100),
         "bottle": Product(name="Bottle", unit_price_cents=2500, inventory=3),

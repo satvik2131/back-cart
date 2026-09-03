@@ -69,6 +69,61 @@ async def committing_session() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
 
+class Tracked:
+    """Records ids created by a committing test so they can be removed."""
+
+    def __init__(self) -> None:
+        self.product_ids: list = []
+        self.cart_ids: list = []
+        self.order_ids: list = []
+        self.coupon_ids: list = []
+        self.idempotency_keys: list = []
+
+
+@pytest_asyncio.fixture
+async def tracked(
+    committing_session: AsyncSession,
+) -> AsyncGenerator[Tracked, None]:
+    """Cleanup registry for committing/concurrency tests.
+
+    Register ids as you create them; on teardown every referenced row is
+    deleted in FK-safe order so committing tests leave the database as they
+    found it.
+    """
+    from sqlalchemy import delete
+
+    from app.features.carts.models import Cart
+    from app.features.orders.models import IdempotencyKey, Order
+    from app.features.products.models import Product
+
+    registry = Tracked()
+    try:
+        yield registry
+    finally:
+        s = committing_session
+        if registry.cart_ids:
+            await s.execute(delete(Order).where(Order.cart_id.in_(registry.cart_ids)))
+        if registry.order_ids:
+            await s.execute(delete(Order).where(Order.id.in_(registry.order_ids)))
+        if registry.idempotency_keys:
+            await s.execute(
+                delete(IdempotencyKey).where(
+                    IdempotencyKey.key.in_(registry.idempotency_keys)
+                )
+            )
+        if registry.coupon_ids:
+            from app.features.coupons.models import Coupon  # noqa: PLC0415
+
+            await s.execute(delete(Coupon).where(Coupon.id.in_(registry.coupon_ids)))
+        if registry.cart_ids:
+            await s.execute(delete(Cart).where(Cart.id.in_(registry.cart_ids)))
+        if registry.product_ids:
+            await s.execute(
+                delete(Product).where(Product.id.in_(registry.product_ids))
+            )
+        await s.commit()
+
+
 @pytest_asyncio.fixture
 async def committing_client() -> AsyncGenerator[AsyncClient, None]:
     """Client whose every request gets its own real, committing session."""
