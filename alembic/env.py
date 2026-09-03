@@ -10,8 +10,9 @@ from alembic import context
 from app.core.config import settings
 from app.db.base import Base
 
-# Import model modules here so that ``Base.metadata`` is populated for
-# autogenerate once models exist. There are none yet.
+# Import every feature's model module here so that ``Base.metadata`` is fully
+# populated before autogenerate runs.
+from app.features.products import models as _products_models  # noqa: F401,E402
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
