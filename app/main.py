@@ -5,11 +5,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.router import api_router
 from app.core.config import settings
+from app.core.errors import register_exception_handlers
 from app.db.session import get_session
+from app.features.products.router import router as products_router
 
 app = FastAPI(title=settings.APP_NAME)
 
+register_exception_handlers(app)
+
 app.include_router(api_router)
+app.include_router(products_router)
 
 
 @app.get("/health")
