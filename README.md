@@ -1,13 +1,14 @@
 # back-cart
 
-Bare-bones FastAPI + PostgreSQL skeleton. No business logic — just enough to
-prove the stack boots and talks to the database.
+Backend for an ecommerce checkout and rewards service. See DECISIONS.md for
+invariants and design decisions. Current state: scaffolding + the Products
+module (read-only catalogue).
 
 ## Stack
 
 - FastAPI + Uvicorn
 - SQLAlchemy 2.x (async) + asyncpg
-- Alembic (async migrations, zero models)
+- Alembic (async migrations)
 - pydantic-settings for configuration
 - PostgreSQL 16
 - Docker + docker compose
@@ -44,8 +45,7 @@ Or open http://localhost:8000/docs.
 ## Migrations
 
 Alembic is configured for async and reads `DATABASE_URL` from the same settings
-as the app. There are no models yet, so `upgrade head` is a clean no-op that
-just creates the `alembic_version` bookkeeping table.
+as the app.
 
 Run inside the running `api` container:
 
@@ -53,33 +53,54 @@ Run inside the running `api` container:
 # Apply migrations
 docker compose exec api alembic upgrade head
 
-# Create a new migration once you add models
+# Create a new migration after changing models
 docker compose exec api alembic revision --autogenerate -m "add something"
 docker compose exec api alembic upgrade head
 ```
 
 (Equivalent Make targets: `make migrate`, `make revision m="..."`.)
 
-## Tests
+## Seed data
 
-A single smoke test asserts `GET /health` returns 200 — it only proves the
-test harness works.
+The product catalogue is inserted by an idempotent script (not a migration —
+see DECISIONS.md §3). After `alembic upgrade head`:
+
+```bash
+docker compose exec api python -m app.features.products.seed   # or: make seed
+```
+
+It adds 6 products, including one low-inventory (2 units) and one out-of-stock
+(0 units) for later oversell / out-of-stock testing.
+
+## Tests
 
 ```bash
 docker compose exec api pytest
 ```
 
+Each test runs in a transaction that is rolled back on teardown, so the suite
+needs the schema applied (`alembic upgrade head`) but not the seed script.
+
 ## Project layout
 
 ```
 app/
-  main.py            FastAPI app + /health and /health/db
-  core/config.py     pydantic-settings configuration
-  db/base.py         empty declarative Base
-  db/session.py      async engine + session factory + get_session dependency
-  api/router.py      empty aggregate router placeholder
-alembic/             async migration environment (no versions yet)
-tests/               conftest stub + health smoke test
+  main.py                  FastAPI app + /health and /health/db + router wiring
+  core/config.py           pydantic-settings configuration
+  core/errors.py           structured error envelope + shared exception handlers
+  db/base.py               declarative Base
+  db/session.py            async engine + session factory + get_session dependency
+  api/router.py            empty aggregate router placeholder
+  features/
+    products/              first feature module
+      models.py            Product ORM model (DB-level CHECK constraints)
+      schemas.py           ProductRead response schema
+      service.py           read queries
+      dependencies.py      get_product_or_404
+      router.py            GET /products, GET /products/{id}
+      seed.py              idempotent catalogue seed script
+alembic/versions/          migrations
+tests/                     transaction-rollback fixtures + feature tests
 ```
 
 ## Make targets
@@ -91,5 +112,6 @@ tests/               conftest stub + health smoke test
 | `make logs` | tail the api logs |
 | `make migrate` | `alembic upgrade head` in the container |
 | `make revision m="..."` | autogenerate a migration |
+| `make seed` | insert the product catalogue (idempotent) |
 | `make test` | run pytest in the container |
 | `make shell` | shell into the api container |

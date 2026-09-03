@@ -225,6 +225,118 @@ etc.)_
 
 ---
 
+### Decision: Primary Key Type — UUID, not Auto-Increment Integer
+
+**Context:** Every table needs a primary key. The choice propagates: carts,
+orders, and coupons will reference products and each other, and IDs appear in
+URLs and error `details`.
+
+**Options considered:**
+- Auto-increment `BIGINT` — compact, human-readable, trivially ordered.
+- Server-generated `UUID` (v4) primary keys.
+- Client-supplied external IDs / SKUs.
+
+**Choice:** Server-generated `UUID` (SQLAlchemy `Uuid`, `default=uuid.uuid4`),
+stored as a native Postgres `uuid`.
+
+**Why:** IDs are exposed in URLs; sequential integers leak catalogue size and
+invite enumeration of carts/orders. UUIDs are generated app-side without a
+round-trip or a shared sequence, which stays correct if the app runs as
+multiple instances. Milestone ordering ("every nth order") will use a dedicated
+monotonic column on `orders`, not the PK, so losing integer ordering costs
+nothing.
+
+**Consequences:** 16 bytes vs 8 per key and per FK; slightly larger indexes.
+All ID fields in API payloads are UUID strings. Not human-memorable in logs —
+acceptable, since logs correlate on structured fields.
+
+---
+
+### Decision: Non-Negativity Enforced by DB CHECK Constraints
+
+**Context:** Invariant 1 (no overselling) and invariant 7 (net total never
+negative) both depend on `inventory` and `unit_price_cents` never going
+negative. Application validation alone can be bypassed by a bug, a migration,
+or a manual `UPDATE`.
+
+**Options considered:**
+- Pydantic / service-layer validation only.
+- `CHECK (inventory >= 0)` and `CHECK (unit_price_cents >= 0)` at the table.
+- Unsigned domain types.
+
+**Choice:** Named CHECK constraints on the table
+(`ck_products_inventory_non_negative`, `ck_products_unit_price_cents_non_negative`).
+
+**Why:** The database is already the concurrency authority (see the persistence
+decision); making it the correctness authority for the same values is
+consistent and cheap. A conditional decrement like
+`UPDATE products SET inventory = inventory - :q WHERE inventory >= :q` plus the
+CHECK gives defence in depth: even a logic error cannot persist a negative row.
+Named constraints so migrations can drop/recreate them deterministically.
+
+**Consequences:** A violating write fails with a `CheckViolationError` that must
+be translated to the structured envelope (a business error, not a 500) when it
+can be triggered by user input in later modules.
+
+---
+
+### Decision: Seed Data as a Standalone Script, Not a Data Migration
+
+**Context:** The spec requires at least 5 seeded products (one low-inventory,
+one out-of-stock). This data has to be reproducible for local dev and tests.
+
+**Options considered:**
+- Alembic data migration that `INSERT`s the rows.
+- Standalone idempotent script run on demand.
+- Fixtures created only in test code.
+
+**Choice:** Standalone script `app/features/products/seed.py`
+(`python -m app.features.products.seed`, also `make seed`); idempotent by
+skipping names that already exist. Tests build their own catalogue in a
+rolled-back transaction and do not depend on the script.
+
+**Why:** Migrations should be purely structural and reversible — mixing in
+seed rows means the catalogue can't change without a new migration, and a
+`downgrade()` would have to delete real data. A script keeps migrations clean,
+lets the catalogue evolve freely, and makes re-seeding an explicit action
+rather than a side effect of schema upgrade.
+
+**Consequences:** Booting the stack does not populate products automatically;
+the README documents the one extra command. Production seeding would be a
+deliberate ops step, which is the desired behaviour.
+
+---
+
+### Decision: Test Isolation via Per-Test Transaction Rollback
+
+**Context:** Endpoint tests need a real database (async SQLAlchemy, Postgres
+CHECK constraints), must not leak state between tests, and must not depend on
+the seed script having run.
+
+**Options considered:**
+- Separate test database, created/migrated/dropped per session.
+- `TRUNCATE` between tests.
+- Each test opens one transaction, the overridden `get_session` dependency
+  shares it, and it is rolled back on teardown.
+
+**Choice:** Per-test transaction rollback. `conftest.py` opens a connection +
+outer transaction, binds an `AsyncSession` with
+`join_transaction_mode="create_savepoint"`, and overrides `get_session` to
+yield that session; teardown rolls back. A dedicated `NullPool` engine keeps
+pooled connections from outliving pytest-asyncio's per-test event loop.
+
+**Why:** No schema management in the test harness, fast, and total isolation —
+a test may even `DELETE FROM products` to assert exact contents without
+touching committed data. Matches the CLAUDE.md rule that no test depends on
+another's leftover state.
+
+**Consequences:** Tests run against whatever database `DATABASE_URL` points at
+and require `alembic upgrade head` to have run there. Code that opens its own
+session/engine instead of the injected one would escape the rollback — a
+constraint to keep in mind for later modules.
+
+---
+
 ## 4. Transaction, Concurrency, and Idempotency Strategy
 
 > One consolidated narrative tying the above decisions together — walk
@@ -300,6 +412,14 @@ _e.g.:_
 > for it, and vague or overclaiming answers read worse than an honest list.
 
 **Implemented:**
+- **Products module.** `Product` model (UUID PK, `name`, `unit_price_cents`,
+  `inventory`, `created_at`/`updated_at`) with DB-level CHECK constraints
+  forbidding negative price or inventory; Alembic migration with a working
+  `downgrade()`; idempotent seed script (6 products, incl. one at 2 units and
+  one at 0); read-only `GET /products` and `GET /products/{id}` (structured
+  404 envelope on miss). Shared error-envelope infrastructure
+  (`app/core/errors.py`: `AppError`/`NotFoundError`/`ValidationError` +
+  handlers) was built here as the first consumer.
 - _e.g. Full checkout transaction with idempotency, inventory locking,
   coupon redemption, order snapshotting._
 - _e.g. Admin coupon generation with milestone uniqueness constraint._
