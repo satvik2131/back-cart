@@ -1,4 +1,4 @@
-.PHONY: up down logs migrate revision test shell
+.PHONY: up down logs migrate revision seed test shell
 
 up:
 	docker compose up --build
@@ -16,6 +16,10 @@ migrate:
 # Create a new migration: make revision m="add users table"
 revision:
 	docker compose exec api alembic revision --autogenerate -m "$(m)"
+
+# Insert the product catalogue (idempotent).
+seed:
+	docker compose exec api python -m app.features.products.seed
 
 test:
 	docker compose exec api pytest
