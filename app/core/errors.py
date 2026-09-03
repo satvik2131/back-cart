@@ -92,6 +92,22 @@ class IdempotencyKeyReuseError(ConflictError):
     code = "IDEMPOTENCY_KEY_REUSED"
 
 
+class InvalidCouponError(ValidationError):
+    code = "INVALID_COUPON"
+
+
+class CouponAlreadyRedeemedError(ConflictError):
+    code = "COUPON_ALREADY_REDEEMED"
+
+
+class MilestoneNotReachedError(ValidationError):
+    code = "MILESTONE_NOT_REACHED"
+
+
+class MilestoneAlreadyRewardedError(ConflictError):
+    code = "MILESTONE_ALREADY_REWARDED"
+
+
 def _envelope(code: str, message: str, details: dict[str, Any]) -> dict[str, Any]:
     return {"error": {"code": code, "message": message, "details": details}}
 

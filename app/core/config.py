@@ -22,6 +22,15 @@ class Settings(BaseSettings):
         "postgresql+asyncpg://postgres:postgres@localhost:5432/back_cart"
     )
 
+    # Optional override for the pytest suite's database. When unset the suite
+    # uses "<DATABASE_URL database>_test" so it never touches dev data.
+    TEST_DATABASE_URL: str | None = None
+
+    # Coupon reward config: one COUPON_DISCOUNT_PERCENT%-off coupon becomes
+    # available at every COUPON_MILESTONE_EVERY-th successful order.
+    COUPON_MILESTONE_EVERY: int = 5
+    COUPON_DISCOUNT_PERCENT: int = 10
+
 
 @lru_cache
 def get_settings() -> Settings:
