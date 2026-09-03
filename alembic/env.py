@@ -12,6 +12,7 @@ from app.db.base import Base
 
 # Import every feature's model module here so that ``Base.metadata`` is fully
 # populated before autogenerate runs.
+from app.features.carts import models as _carts_models  # noqa: F401,E402
 from app.features.products import models as _products_models  # noqa: F401,E402
 
 config = context.config
