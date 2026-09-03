@@ -7,6 +7,7 @@ from app.api.router import api_router
 from app.core.config import settings
 from app.core.errors import register_exception_handlers
 from app.db.session import get_session
+from app.features.carts.router import router as carts_router
 from app.features.products.router import router as products_router
 
 app = FastAPI(title=settings.APP_NAME)
@@ -15,6 +16,7 @@ register_exception_handlers(app)
 
 app.include_router(api_router)
 app.include_router(products_router)
+app.include_router(carts_router)
 
 
 @app.get("/health")
