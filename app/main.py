@@ -36,6 +36,12 @@ async def health_db(session: AsyncSession = Depends(get_session)) -> JSONRespons
     except Exception as exc:  # noqa: BLE001 - surface any connectivity error
         return JSONResponse(
             status_code=503,
-            content={"status": "error", "db": "unavailable", "detail": str(exc)},
+            content={
+                "error": {
+                    "code": "DB_UNAVAILABLE",
+                    "message": "Database connectivity check failed.",
+                    "details": {"reason": str(exc)},
+                }
+            },
         )
     return JSONResponse(content={"status": "ok", "db": "connected"})

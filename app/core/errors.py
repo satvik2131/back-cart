@@ -9,6 +9,7 @@ Feature code raises :class:`AppError` subclasses instead of ``HTTPException`` so
 the envelope stays consistent. Canonical codes are catalogued in DECISIONS.md §6.
 """
 
+import logging
 from typing import Any
 
 from fastapi import FastAPI, Request, status
@@ -16,6 +17,17 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
+
+logger = logging.getLogger("back_cart.errors")
+
+# HTTP status -> stable error code for framework-raised HTTPExceptions
+# (unmatched routes, wrong method, etc.) that don't come from an AppError.
+_STATUS_CODES: dict[int, str] = {
+    status.HTTP_404_NOT_FOUND: "NOT_FOUND",
+    status.HTTP_405_METHOD_NOT_ALLOWED: "METHOD_NOT_ALLOWED",
+    status.HTTP_422_UNPROCESSABLE_ENTITY: "VALIDATION_ERROR",
+}
 
 
 class ErrorBody(BaseModel):
@@ -132,6 +144,38 @@ async def _request_validation_handler(
     )
 
 
+async def _http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+) -> JSONResponse:
+    """Wrap framework HTTPExceptions (unmatched route, wrong method, …) in the
+    same envelope so no error response escapes it."""
+    code = _STATUS_CODES.get(exc.status_code, "HTTP_ERROR")
+    message = exc.detail if isinstance(exc.detail, str) else code.replace("_", " ").title()
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_envelope(code, message, {}),
+        headers=getattr(exc, "headers", None),
+    )
+
+
+async def _unhandled_exception_handler(
+    request: Request, exc: Exception
+) -> JSONResponse:
+    """Last resort: an unexpected failure (a bug, the DB down). Logged at ERROR;
+    the client gets the envelope with no internal detail leaked."""
+    logger.exception(
+        "unhandled error on %s %s", request.method, request.url.path
+    )
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=_envelope(
+            "INTERNAL_ERROR", "An unexpected error occurred.", {}
+        ),
+    )
+
+
 def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(AppError, _app_error_handler)
     app.add_exception_handler(RequestValidationError, _request_validation_handler)
+    app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
+    app.add_exception_handler(Exception, _unhandled_exception_handler)
