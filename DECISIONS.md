@@ -81,18 +81,33 @@ create a duplicate order.
 - No idempotency handling; rely on "cart already checked out" as an
   implicit guard.
 
-**Choice:** _e.g. Client-supplied `Idempotency-Key` header, required,
-stored alongside the resulting order/response in an `idempotency_keys`
-table with a unique constraint._
+**Choice:** Client-supplied `Idempotency-Key` **HTTP header**, required on
+`POST /carts/{id}/checkout` (missing → 422). On success the full response body
+and status code are stored in an `idempotency_keys` table whose **primary key is
+the key itself** (so it is unique and indexed). A request whose key is already
+present returns the stored body + status verbatim without re-running anything.
 
-**Why:** _Explain trade-offs — e.g. relying solely on "cart already checked
-out" fails if the first attempt hadn't committed yet when the retry
-arrives; a dedicated key table with a unique constraint gives an atomic,
-race-safe check at the DB level._
+**Why:**
+- *Header, not derived from cart content:* a derived key would change if the cart
+  were edited between the original attempt and the retry, defeating the purpose.
+  A client-owned key is stable across retries by construction.
+- *"Cart already checked out" is not enough on its own:* if the first attempt has
+  not committed when the retry arrives, the cart still looks `open` and the retry
+  would proceed. The key table closes that window — and the checkout also does a
+  second key lookup after it acquires the cart lock, so a retry that lost the
+  race still replays the winner's response instead of getting a 409.
+- *Key as primary key:* the DB rejects a concurrent duplicate insert; no
+  application-level check-then-insert race.
+- Storing the whole response (not just the order id) means a replay is a single
+  row read with zero risk of re-deriving a different body.
 
-**Consequences:** _e.g. Requires clients to generate and persist a key
-across retries (documented in API docs); adds one extra table and a lookup
-on the hot path; makes replay detection trivial and safe under concurrency._
+**Consequences:** Clients must generate and persist a key across retries
+(documented on the endpoint). One extra table and one indexed lookup on the hot
+path. A key is bound to the cart it was first used with — presenting it for a
+different cart is a client bug and returns `409 IDEMPOTENCY_KEY_REUSED` rather
+than silently replaying the wrong order. Keys are never garbage-collected in
+scope (small, and needed for the lifetime of retry windows); a TTL sweep is a
+production follow-up.
 
 ---
 
@@ -109,17 +124,33 @@ of a limited-inventory product.
   WHERE id = ? AND inventory >= ?`), checking rows-affected.
 - Application-level mutex (only viable single-instance, in-memory).
 
-**Choice:** _State your pick._
+**Choice:** **Atomic conditional `UPDATE`**, one per cart line, inside the
+checkout transaction:
 
-**Why:** _e.g. Atomic conditional update avoids taking explicit locks and
-scales better under contention than `FOR UPDATE`, at the cost of needing to
-handle a "zero rows affected" case explicitly as a business error rather
-than a DB error._
+```sql
+UPDATE products SET inventory = inventory - :qty
+WHERE id = :product_id AND inventory >= :qty
+```
 
-**Consequences:** _e.g. Simple and DB-portable; but if checkout does
-multiple inventory-affecting operations, you lose true multi-row atomicity
-unless wrapped in a transaction — document how you handled multi-item
-carts specifically._
+`rowcount == 0` means the guard failed → raise `InsufficientInventoryError`
+(409, naming the product) → the whole transaction rolls back.
+
+**Why:** The `WHERE inventory >= :qty` predicate is evaluated by Postgres *after*
+it takes the row lock (READ COMMITTED re-reads the row), so two concurrent
+checkouts for the last unit cannot both pass — the second sees the decremented
+value and affects zero rows. No explicit `SELECT ... FOR UPDATE` on products, no
+version column / retry loop. Invariant 1 is enforced at the one statement that
+changes inventory. A regression test (product seeded with 1 unit, two concurrent
+checkouts) confirms exactly one 201 + one 409 and final inventory 0; swapping in
+a naive read-then-write decrement makes that test fail (both succeed).
+
+**Consequences:** Multi-item carts decrement product-by-product within the single
+transaction; if line 3 fails, lines 1–2 (and everything else) roll back, so
+inventory is never left partially decremented — covered by a dedicated test.
+Decrements on *different* products don't contend. A deadlock is theoretically
+possible if two carts hold the same two products in opposite order; ordering the
+decrements by `product_id` (or product name, as done here for a stable total)
+avoids it.
 
 ---
 
@@ -159,18 +190,25 @@ error, and totals must never go negative.
 - Store all money as integer minor units (cents/paise).
 - Use a `Decimal` type throughout with explicit precision.
 
-**Choice:** _State your pick (integer minor units is the common, defensible
-choice)._
+**Choice:** **Integer minor units (cents) everywhere** — DB columns
+(`Integer`), all arithmetic, and JSON request/response fields. No `float`, no
+`Decimal`, no strings. Field names always carry the unit
+(`unit_price_cents`, `gross_total_cents`, `discount_cents`, …).
 
-**Why:** _e.g. Integer arithmetic sidesteps float rounding entirely; a
-fixed rounding rule (e.g., discount = floor(gross * pct / 100)) is applied
-once at discount-calculation time and documented; net total is clamped at
-`max(0, gross - discount)`._
+**Why:** Integer arithmetic has no rounding error to reason about. The only place
+rounding happens is the discount, with one fixed rule applied once:
+`discount_cents = floor(gross_total_cents * discount_percent / 100)` (Python `//`
+on ints). `net_total_cents = gross_total_cents - discount_cents`, and because
+`discount_percent` is constrained to `1..100` (Phase 2) the discount can never
+exceed the gross, so `net` is always ≥ 0. The `orders` table backs this with
+CHECK constraints: `discount_cents >= 0`, `discount_cents <= gross_total_cents`,
+`net_total_cents = gross_total_cents - discount_cents` — invariant 7 cannot be
+violated by any write, not even a manual one.
 
-**Consequences:** _e.g. All API request/response bodies use integers for
-money fields (documented in API docs) rather than floats, which is a
-deliberate departure from naive JSON conventions — worth calling out
-explicitly._
+**Consequences:** API money fields are integers, which clients must not treat as
+dollars — called out on every schema. `discount_cents` stored on an order is the
+*effective, applied* discount (already clamped), so the stored `net` is exactly
+`gross - discount` with no separate "requested vs applied" bookkeeping.
 
 ---
 
@@ -469,32 +507,87 @@ others on that cart.
 
 ---
 
+### Decision: Checkout Is One Transaction, With an Explicit Rollback
+
+**Context:** Checkout does several writes that must all happen or none: N
+inventory decrements, an order header, N order lines, the cart status flip, the
+idempotency record. Invariant 4 needs a failed attempt to leave *nothing*
+behind so the client can retry the same key from a clean slate.
+
+**Options considered:**
+- One DB transaction per checkout, commit at the end, rely on the session /
+  connection-pool reset to roll back on error.
+- One DB transaction with an **explicit** `rollback()` in the endpoint's
+  exception path.
+- Multiple smaller transactions (decrement, then order, then …) with
+  compensating writes on failure.
+
+**Choice:** A single transaction for the whole flow — the request's session,
+committed once at the very end by the router. The checkout endpoint wraps the
+service call in `try / except: await session.rollback(); raise`. Step order:
+key lookup → lock cart → validate open → load lines → **decrement inventory** →
+compute totals → insert order + snapshotted lines → flip cart to `checked_out` →
+write idempotency row → commit.
+
+**Why:** Smaller transactions with compensation are exactly the hand-rolled
+distributed-transaction logic the house rules push back on — one transaction
+gets atomicity and rollback for free from Postgres. The rollback is written
+explicitly rather than left to pool-return semantics because (a) it makes the
+guarantee obvious in the code, and (b) the test suite's shared-transaction
+fixture doesn't return connections to a pool between requests, so an implicit
+reset wouldn't fire there — the "insufficient inventory leaves nothing partially
+decremented" test would give a false pass. Inventory is decremented *before* the
+order is built so the common failure (not enough stock) costs the least work,
+and — relevant to Phase 2 — so a coupon is only ever touched after inventory has
+already succeeded.
+
+**Consequences:** The whole checkout holds the cart-row lock and the affected
+product-row locks for its duration; at this scale that's sub-millisecond. If
+checkout grew expensive (e.g. a real payment call), the payment step would want
+to sit outside the DB transaction with its own idempotency handling — noted for
+future work.
+
+---
+
 ## 4. Transaction, Concurrency, and Idempotency Strategy
 
 > One consolidated narrative tying the above decisions together — walk
 > through what actually happens, step by step, during a checkout call, and
 > point to exactly where each invariant is enforced.
 
-_e.g.:_
+**Checkout, step by step (as implemented — Phase 1; step 3d is Phase 2):**
 
-1. Client calls `POST /carts/{id}/checkout` with `Idempotency-Key: <key>`.
-2. Server checks the `idempotency_keys` table for `<key>`; if found, returns
-   the stored response verbatim (no re-processing).
-3. Otherwise, opens a DB transaction:
-   a. Locks/re-validates the cart (must be `open`).
-   b. For each line item, attempts the atomic conditional inventory
-      decrement; any zero-rows-affected result aborts the transaction with
-      `INSUFFICIENT_INVENTORY`.
-   c. If a coupon code was supplied, validates and atomically transitions
-      its status to `redeemed`, scoped to this order; failure aborts.
-   d. Computes gross total, discount, net total in integer cents.
-   e. Inserts the order + order line items (price-snapshotted).
-   f. Marks the cart `checked_out`.
-   g. Records the idempotency key + response.
-   h. Commits.
-4. On any failure inside the transaction, the whole thing rolls back —
-   inventory, coupon status, and cart status all revert together, so a
-   failed checkout can be safely retried.
+1. Client calls `POST /carts/{id}/checkout` with header `Idempotency-Key: <key>`
+   (missing → `422 VALIDATION_ERROR`).
+2. Fast path: look up `<key>` in `idempotency_keys`. If present and bound to
+   this cart → return the stored body + status verbatim (invariant 4). If
+   present but bound to a different cart → `409 IDEMPOTENCY_KEY_REUSED`.
+3. Otherwise the request's single transaction runs:
+   a. `SELECT ... FOR UPDATE` the cart row. Missing → 404.
+   b. If the cart is not `open`: look up `<key>` again (a concurrent request
+      with the same key may have just committed) — replay if found, else
+      `409 CART_ALREADY_CHECKED_OUT`. *(enforces invariant 2, invariant 4)*
+   c. Load cart lines joined to products, ordered by product name. Empty →
+      `422 EMPTY_CART`.
+   d. For each line: `UPDATE products SET inventory = inventory - qty WHERE id = ?
+      AND inventory >= qty`. `rowcount == 0` → `409 INSUFFICIENT_INVENTORY`
+      (transaction aborts). *(enforces invariant 1)*
+   e. *(Phase 2)* If `coupon_code` given: `UPDATE coupons SET status='redeemed',
+      redeemed_by_order_id=? WHERE code=? AND status='available'`; `rowcount==0`
+      → `409 COUPON_ALREADY_REDEEMED` / `422 INVALID_COUPON`. Runs **after** (d)
+      so a stock failure never touches the coupon. *(enforces invariant 6)*
+   f. `gross_total_cents` = Σ(current `unit_price_cents` × qty).
+      `discount_cents` = 0 in Phase 1 (Phase 2: `floor(gross × pct / 100)`).
+      `net_total_cents = gross_total_cents - discount_cents`. *(invariant 7,
+      also DB-enforced by CHECK)*
+   g. Insert the `Order` and one `OrderItem` per line, each carrying
+      `product_name_snapshot` + `unit_price_cents_snapshot`. *(invariant 3)*
+   h. Flip the cart to `checked_out`.
+   i. Insert the `idempotency_keys` row (key, cart_id, response body, 201).
+   j. Commit.
+4. On any exception in step 3 the endpoint calls `session.rollback()` and
+   re-raises — inventory, order rows, cart status and (Phase 2) coupon status
+   all revert together, so the client can safely retry with the same key.
 
 ---
 
@@ -502,11 +595,18 @@ _e.g.:_
 
 > Restate concretely, in one place, so it's easy to audit.
 
-- All money stored and computed as `int` **minor units** (e.g., cents).
-- Discount = `floor(gross_total * discount_pct / 100)`.
-- Net total = `max(0, gross_total - discount)`.
-- API request/response money fields are integers, not floats or strings —
-  documented explicitly in API docs to avoid client confusion.
+- All money stored and computed as `int` **minor units** (cents). No floats, no
+  `Decimal`, no strings, anywhere.
+- Every money field name carries the unit: `*_cents`.
+- Discount = `floor(gross_total_cents * discount_percent / 100)` — Python integer
+  `//`. Applied once, at checkout, only after inventory succeeds.
+- `net_total_cents = gross_total_cents - discount_cents`. Never negative:
+  `discount_percent` is bounded `1..100` so the discount can't exceed the gross,
+  and the `orders` table has CHECK constraints
+  (`discount_cents <= gross_total_cents`,
+  `net_total_cents = gross_total_cents - discount_cents`) that reject any write
+  that would break invariant 7.
+- API request/response money fields are integers, not floats or strings.
 
 ---
 
@@ -530,8 +630,10 @@ _e.g.:_
 | `VALIDATION_ERROR` | 422 | Malformed or invalid request body |
 | `NOT_FOUND` | 404 | Cart/product/order/coupon does not exist |
 | `CONFLICT` | 409 | Generic state conflict (base for the specific 409s below) |
-| `CART_ALREADY_CHECKED_OUT` | 409 | Mutation attempted on a checked-out cart |
-| `INSUFFICIENT_INVENTORY` | 409 | Requested quantity exceeds availability |
+| `CART_ALREADY_CHECKED_OUT` | 409 | Mutation or checkout attempted on a checked-out cart |
+| `INSUFFICIENT_INVENTORY` | 409 | Requested quantity exceeds availability (checkout: authoritative; cart: soft) |
+| `EMPTY_CART` | 422 | Checkout attempted on a cart with no items |
+| `IDEMPOTENCY_KEY_REUSED` | 409 | `Idempotency-Key` already used for a different cart |
 | `INVALID_COUPON` | 422 | Coupon code doesn't exist or isn't eligible |
 | `COUPON_ALREADY_REDEEMED` | 409 | Coupon was already spent |
 | `MILESTONE_NOT_REACHED` | 422 | Admin requested coupon gen before milestone hit |
@@ -565,10 +667,23 @@ _e.g.:_
   / `InsufficientInventoryError` added to `app/core/errors.py`. Tests include a
   15-way genuinely-concurrent add asserting no lost updates or duplicate rows.
   Checkout itself is **not** part of this module.
-- _e.g. Full checkout transaction with idempotency, inventory locking,
-  coupon redemption, order snapshotting._
-- _e.g. Admin coupon generation with milestone uniqueness constraint._
-- _e.g. Admin report as a live aggregate query._
+- **Checkout & Orders module (Phase 1).** `Order` (immutable, `order_status`
+  enum, invariant-7 CHECK constraints), `OrderItem` (name + unit price
+  snapshotted at checkout, `line_total` CHECK, unique per product), and
+  `idempotency_keys` (key = PK, stores full response body + status).
+  `POST /carts/{id}/checkout` — required `Idempotency-Key` header, verbatim
+  replay of a stored response, single transaction with explicit rollback:
+  `FOR UPDATE` cart lock → atomic conditional `UPDATE ... WHERE inventory >= qty`
+  per line → order + snapshot lines → cart `checked_out` → idempotency row.
+  `GET /orders/{id}` returns only snapshots, never re-derived. Error codes
+  `EMPTY_CART`, `IDEMPOTENCY_KEY_REUSED` added. Seven tests including two real
+  concurrency tests (two carts / one unit → exactly one 201 + one 409, final
+  inventory 0; same cart + same key ×8 concurrently → exactly one order);
+  verified both fail if the atomic decrement / idempotency guard is removed.
+  Coupon redemption is a documented extension point, not yet wired (below).
+- _Phase 2:_ Coupons — generation + redemption wired into the checkout
+  transaction.
+- _Phase 3:_ Admin report as a live aggregate query.
 
 **Intentionally deferred (with reasoning):**
 - **Structured log events on mutations.** The house rules call for a structured
@@ -579,12 +694,19 @@ _e.g.:_
   dedicated step so it lands once, consistently, across carts + checkout +
   coupons rather than ad hoc per module. The carts endpoints are otherwise
   observable via the error envelope + HTTP status.
+- **Coupon redemption at checkout (until Phase 2).** `POST /carts/{id}/checkout`
+  accepts an optional `coupon_code` in the request body *now* (the
+  `CheckoutRequest` schema), but Phase 1 ignores it — coupons don't exist yet.
+  Phase 2 extends the *same* checkout transaction (step 3e in §4) rather than
+  adding a parallel path. Until then every order has `discount_cents = 0`.
+- **Payment.** Treated as implicitly successful — a committed checkout *is* a
+  successful payment. No fake-failure payment abstraction; if one were added, a
+  persisted `FAILED` order state and a payment-idempotency layer outside the DB
+  transaction would need designing (noted in §3 "Checkout Transaction Boundary").
 - _e.g. Multi-instance distributed locking beyond what Postgres provides
   natively — deferred because a single-instance deployment with DB-level
   transactions satisfies the stated invariants; see Section 8 for how this
   would change with horizontal scaling._
-- _e.g. Real payment gateway integration — used a fake payment abstraction
-  that always succeeds, per the spec's explicit allowance._
 - _e.g. Customer identity / auth — explicitly out of scope per spec._
 - _e.g. Pagination on report/order listing endpoints — not required at this
   data scale within the timebox._
