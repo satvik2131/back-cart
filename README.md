@@ -1,8 +1,9 @@
 # back-cart
 
 Backend for an ecommerce checkout and rewards service. See DECISIONS.md for
-invariants and design decisions. Current state: scaffolding + the Products
-module (read-only catalogue).
+invariants and design decisions. Current state: scaffolding, the Products
+module (read-only catalogue), and the Carts module (carts + cart items, up to
+but not including checkout).
 
 ## Stack
 
@@ -112,15 +113,15 @@ app/
   db/session.py            async engine + session factory + get_session dependency
   api/router.py            empty aggregate router placeholder
   features/
-    products/              first feature module
-      models.py            Product ORM model (DB-level CHECK constraints)
-      schemas.py           ProductRead response schema
-      service.py           read queries
-      dependencies.py      get_product_or_404
-      router.py            GET /products, GET /products/{id}
-      seed.py              idempotent catalogue seed script
+    products/              catalogue (read-only)
+      models.py schemas.py service.py dependencies.py router.py seed.py
+    carts/                 carts + cart items (pre-checkout)
+      models.py            Cart (native status enum) + CartItem (unique
+                           cart_id+product_id, quantity>0 CHECK, no price)
+      schemas.py service.py dependencies.py router.py
 alembic/versions/          migrations
-tests/                     transaction-rollback fixtures + feature tests
+tests/                     transaction-rollback + committing-client fixtures,
+                           feature tests (incl. a real-concurrency cart test)
 ```
 
 ## Make targets
