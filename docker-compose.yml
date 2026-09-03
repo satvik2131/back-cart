@@ -31,5 +31,28 @@ services:
       timeout: 5s
       retries: 10
 
+  # Optional DB admin UI. NOT part of the default stack — `docker compose up`
+  # ignores it. Start it explicitly:
+  #   docker compose --profile tools up -d pgadmin   (or: make pgadmin)
+  # then open http://localhost:5051 — desktop mode, no pgAdmin login (if a login
+  # screen appears, use admin@example.com / admin). The "back-cart" server is
+  # pre-registered; enter DB password `postgres` on first connect.
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    profiles: ["tools"]
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "5051:80"
+    depends_on:
+      - db
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./docker/pgadmin/servers.json:/pgadmin4/servers.json:ro
+
 volumes:
   postgres_data:
+  pgadmin_data:

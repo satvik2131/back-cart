@@ -1,4 +1,4 @@
-.PHONY: up down logs migrate revision seed test shell
+.PHONY: up down logs migrate revision seed test shell pgadmin
 
 up:
 	docker compose up --build
@@ -26,3 +26,7 @@ test:
 
 shell:
 	docker compose exec api bash
+
+# Start the optional pgAdmin UI on http://localhost:5051
+pgadmin:
+	docker compose --profile tools up -d pgadmin

@@ -72,6 +72,26 @@ docker compose exec api python -m app.features.products.seed   # or: make seed
 It adds 6 products, including one low-inventory (2 units) and one out-of-stock
 (0 units) for later oversell / out-of-stock testing.
 
+## Inspecting the database (optional)
+
+`psql` is always available:
+
+```bash
+docker compose exec db psql -U postgres -d back_cart -c "\dt"
+```
+
+For a UI, an opt-in pgAdmin lives behind the `tools` compose profile, so the
+default `docker compose up` never starts it:
+
+```bash
+docker compose --profile tools up -d pgadmin   # or: make pgadmin
+```
+
+Open http://localhost:5051 (desktop mode — no pgAdmin login; if prompted,
+`admin@example.com` / `admin`). The **back-cart** server is pre-registered;
+enter the database password `postgres` on first connect. Stop it with
+`docker compose --profile tools down`.
+
 ## Tests
 
 ```bash
@@ -113,5 +133,6 @@ tests/                     transaction-rollback fixtures + feature tests
 | `make migrate` | `alembic upgrade head` in the container |
 | `make revision m="..."` | autogenerate a migration |
 | `make seed` | insert the product catalogue (idempotent) |
+| `make pgadmin` | start the optional pgAdmin UI on :5051 |
 | `make test` | run pytest in the container |
 | `make shell` | shell into the api container |
