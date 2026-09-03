@@ -3,12 +3,13 @@ import uuid
 
 import pytest
 import pytest_asyncio
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.features.carts.models import Cart, CartItem
-from app.features.orders.models import Order, OrderItem
+from app.features.carts.models import Cart
+from app.features.orders.models import Order
 from app.features.products.models import Product
+from tests.conftest import clear_domain
 
 pytestmark = pytest.mark.asyncio
 
@@ -22,11 +23,7 @@ HEADERS = {"Idempotency-Key": "test-key-1"}
 
 @pytest_asyncio.fixture
 async def products(db_session: AsyncSession) -> dict[str, Product]:
-    await db_session.execute(delete(OrderItem))
-    await db_session.execute(delete(Order))
-    await db_session.execute(delete(CartItem))
-    await db_session.execute(delete(Cart))
-    await db_session.execute(delete(Product))
+    await clear_domain(db_session)
     catalogue = {
         "widget": Product(name="Widget", unit_price_cents=1000, inventory=10),
         "gadget": Product(name="Gadget", unit_price_cents=2500, inventory=4),

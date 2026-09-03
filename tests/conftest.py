@@ -1,32 +1,81 @@
 """Shared pytest fixtures.
 
+Tests run against a **dedicated** database (``<DATABASE_URL db>_test``), created
+and schema-loaded once per session from the ORM metadata, so the suite never
+touches the dev database. Set ``TEST_DATABASE_URL`` to override.
+
 Two client fixtures, for two kinds of test:
 
 * ``client`` — every request shares one session bound to a single transaction
-  that is rolled back on teardown (see DECISIONS.md §3). Total isolation, no
-  cleanup needed. Use for everything sequential.
+  that is rolled back on teardown (see DECISIONS.md §3). Total isolation.
 * ``committing_client`` — every request gets its own real session that actually
-  commits. Needed for genuine-concurrency tests, since a single shared
-  transaction cannot exercise row-level locking. Tests using it must delete the
-  rows they create (``committing_session`` is provided for setup/teardown).
+  commits, for genuine-concurrency tests (a single shared transaction can't
+  exercise row-level locking). Such tests start from an empty DB (the ``tracked``
+  fixture clears it) and clean up their rows.
 
-A dedicated ``NullPool`` engine backs both so no pooled connection outlives the
-per-test event loop that pytest-asyncio creates. Requires the schema to exist in
-the target database (``alembic upgrade head``).
+A ``NullPool`` engine backs both so no pooled connection outlives the per-test
+event loop pytest-asyncio creates.
 """
 
+import asyncio
 from collections.abc import AsyncGenerator
 
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import delete, make_url, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.core.config import settings
+from app.db.base import Base
 from app.db.session import get_session
+from app.features.carts.models import Cart, CartItem
+from app.features.coupons.models import Coupon
+from app.features.orders.models import IdempotencyKey, Order, OrderItem
+from app.features.products.models import Product
 from app.main import app
 
-test_engine = create_async_engine(settings.DATABASE_URL, poolclass=NullPool)
+_main_url = make_url(settings.DATABASE_URL)
+_test_db_name = (_main_url.database or "back_cart") + "_test"
+TEST_DATABASE_URL = settings.TEST_DATABASE_URL or _main_url.set(
+    database=_test_db_name
+).render_as_string(hide_password=False)
+
+
+async def _provision_test_db() -> None:
+    admin_engine = create_async_engine(
+        _main_url.set(database="postgres").render_as_string(hide_password=False),
+        isolation_level="AUTOCOMMIT",
+        poolclass=NullPool,
+    )
+    async with admin_engine.connect() as conn:
+        exists = await conn.scalar(
+            text("SELECT 1 FROM pg_database WHERE datname = :name"),
+            {"name": _test_db_name},
+        )
+        if not exists:
+            await conn.execute(text(f'CREATE DATABASE "{_test_db_name}"'))
+    await admin_engine.dispose()
+
+    schema_engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    async with schema_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(Base.metadata.create_all)
+    await schema_engine.dispose()
+
+
+asyncio.run(_provision_test_db())
+
+test_engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+
+# FK-safe delete order: referencing rows before their targets.
+_TEARDOWN_ORDER = (OrderItem, Coupon, Order, IdempotencyKey, CartItem, Cart, Product)
+
+
+async def clear_domain(session: AsyncSession) -> None:
+    """Delete every domain row, in FK-safe order."""
+    for model in _TEARDOWN_ORDER:
+        await session.execute(delete(model))
 
 
 @pytest_asyncio.fixture
@@ -86,35 +135,38 @@ async def tracked(
 ) -> AsyncGenerator[Tracked, None]:
     """Cleanup registry for committing/concurrency tests.
 
-    Register ids as you create them; on teardown every referenced row is
-    deleted in FK-safe order so committing tests leave the database as they
-    found it.
+    Starts each such test from an empty database and, on teardown, removes the
+    ids that were registered (FK-safe: coupons before orders, orders before
+    carts, everything before products).
     """
-    from sqlalchemy import delete
+    from sqlalchemy import or_
 
-    from app.features.carts.models import Cart
-    from app.features.orders.models import IdempotencyKey, Order
-    from app.features.products.models import Product
+    await clear_domain(committing_session)
+    await committing_session.commit()
 
     registry = Tracked()
     try:
         yield registry
     finally:
         s = committing_session
+        order_filter = []
         if registry.cart_ids:
-            await s.execute(delete(Order).where(Order.cart_id.in_(registry.cart_ids)))
+            order_filter.append(Order.cart_id.in_(registry.cart_ids))
         if registry.order_ids:
-            await s.execute(delete(Order).where(Order.id.in_(registry.order_ids)))
+            order_filter.append(Order.id.in_(registry.order_ids))
+
+        if registry.coupon_ids:
+            await s.execute(
+                delete(Coupon).where(Coupon.id.in_(registry.coupon_ids))
+            )
+        if order_filter:
+            await s.execute(delete(Order).where(or_(*order_filter)))
         if registry.idempotency_keys:
             await s.execute(
                 delete(IdempotencyKey).where(
                     IdempotencyKey.key.in_(registry.idempotency_keys)
                 )
             )
-        if registry.coupon_ids:
-            from app.features.coupons.models import Coupon  # noqa: PLC0415
-
-            await s.execute(delete(Coupon).where(Coupon.id.in_(registry.coupon_ids)))
         if registry.cart_ids:
             await s.execute(delete(Cart).where(Cart.id.in_(registry.cart_ids)))
         if registry.product_ids:
