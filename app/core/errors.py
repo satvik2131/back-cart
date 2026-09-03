@@ -82,6 +82,16 @@ class InsufficientInventoryError(ConflictError):
     code = "INSUFFICIENT_INVENTORY"
 
 
+class EmptyCartError(ValidationError):
+    code = "EMPTY_CART"
+
+
+class IdempotencyKeyReuseError(ConflictError):
+    """The same Idempotency-Key was presented for a different cart."""
+
+    code = "IDEMPOTENCY_KEY_REUSED"
+
+
 def _envelope(code: str, message: str, details: dict[str, Any]) -> dict[str, Any]:
     return {"error": {"code": code, "message": message, "details": details}}
 
