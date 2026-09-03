@@ -46,13 +46,14 @@
 
 | # | Ambiguity | Semantics chosen |
 |---|-----------|-------------------|
-| 1 | Does checkout use the price at add-to-cart time or the current product price? | _e.g. Current price at checkout time; cart view shows current price with a `price_changed` flag if it differs from when the item was added._ |
-| 2 | What happens if inventory drops below a cart's requested quantity before checkout? | _e.g. Checkout fails with `409 INSUFFICIENT_INVENTORY`; client must adjust cart quantity and retry — no automatic partial fulfillment._ |
+| 1 | Does checkout use the price at add-to-cart time or the current product price? | **Current price.** Cart items store no price; the cart view computes every line subtotal and the cart total live from `Product.unit_price_cents` at read time. The price snapshot is taken only when the order is created at checkout (invariant 3). See §3 "Cart Items Hold No Price". |
+| 2 | What happens if inventory drops below a cart's requested quantity before checkout? | Adding/updating a cart item runs a **soft** inventory check (409 `INSUFFICIENT_INVENTORY` if the resulting quantity exceeds current stock) but reserves nothing. The **authoritative** check is an atomic conditional decrement inside the checkout transaction; a cart that was fine at add-time can still fail checkout with `INSUFFICIENT_INVENTORY`, and the client must reduce quantity and retry. No partial fulfilment. See §3 "Soft Inventory Check at Add-Time". |
 | 3 | Can a coupon be applied to a cart below some minimum order value? | _e.g. No minimum; discount simply cannot make total negative (clamped at zero)._ |
 | 4 | Is a coupon single-use globally or single-use per customer? | _e.g. Single-use globally (no customer identity in scope per spec) — first successful redemption consumes it._ |
 | 5 | Does a milestone count all created orders or only ones that survive checkout validation? | _e.g. Only orders that reach `SUCCESS` status count toward milestones — abandoned/failed checkouts don't count._ |
 | 6 | What is the idempotency key — client-supplied header, or derived from cart state? | _e.g. Client-supplied `Idempotency-Key` header, required on checkout; server stores request hash + response for replay detection._ |
-| 7 | Can an item quantity of 0 be added, or must it be removed instead? | _e.g. Quantity must be ≥1 on add; setting quantity to 0 via update is treated as remove._ |
+| 7 | Can an item quantity of 0 be added, or must it be removed instead? | **Quantity must be ≥ 1 on `POST /carts/{id}/items`** (rejected 422 otherwise, enforced by both the Pydantic schema and a `quantity > 0` DB CHECK). On `PATCH .../items/{item_id}`, **quantity 0 means remove** the line; negative is 422. |
+| 8 | `product_id` that is malformed vs. well-formed but unknown when adding an item. | Malformed (not a UUID) → **422 `VALIDATION_ERROR`** (schema). Well-formed but no such product → **404 `NOT_FOUND`**. Both are rejected; neither is silently accepted. |
 
 _Add rows for anything else you had to decide unilaterally._
 
@@ -333,7 +334,138 @@ another's leftover state.
 **Consequences:** Tests run against whatever database `DATABASE_URL` points at
 and require `alembic upgrade head` to have run there. Code that opens its own
 session/engine instead of the injected one would escape the rollback — a
-constraint to keep in mind for later modules.
+constraint to keep in mind for later modules. Genuine-concurrency tests can't
+use this fixture (one shared transaction can't exercise row locking); they use a
+second `committing_client` fixture with real per-request sessions and clean up
+their own rows.
+
+---
+
+### Decision: Cart Items Hold No Price — Totals Computed Live
+
+**Context:** A cart is edited over time while product prices may change. Where
+does the price a customer "sees" come from — a value copied into the cart line
+when the item was added, or the product's current price?
+
+**Options considered:**
+- Snapshot `unit_price_cents` onto `CartItem` at add-time; cart total is the sum
+  of snapshots.
+- Store no price on `CartItem`; compute every subtotal and the cart total from
+  `Product.unit_price_cents` at read/checkout time.
+- Store the snapshot *and* a live price, exposing a `price_changed` flag.
+
+**Choice:** `CartItem` has only `cart_id`, `product_id`, `quantity`, timestamps —
+**no price column.** `GET /carts/{id}` joins to `products` and computes
+`line_subtotal_cents = product.unit_price_cents * quantity` and
+`total_cents = sum(...)` on every read.
+
+**Why:** Invariant 3 requires the *order* to be an immutable snapshot; it says
+nothing about the cart, which is mutable scratch space by nature. Keeping the
+cart price-free means there is exactly one place a snapshot is taken (order
+creation at checkout), so there's no risk of a stale cart snapshot disagreeing
+with what checkout actually charges. It also removes a whole class of "cart says
+X, checkout charged Y" bugs. The price a customer sees in the cart is always the
+price checkout will use (subject to change between the two calls, which is
+inherent and also true of the snapshot approach).
+
+**Consequences:** The cart view is a small join + arithmetic rather than a column
+read — negligible at this scale. A customer can see their cart total move if a
+price changes before they check out; acceptable and arguably more honest. The
+checkout module is solely responsible for snapshotting price onto `OrderLine`.
+
+---
+
+### Decision: Soft Inventory Check at Add-Time, Authoritative Check at Checkout
+
+**Context:** "Product has enough inventory available (409 if not)" is required on
+add-to-cart, but carts are not orders and adding to a cart must not reserve
+stock (that would let an abandoned cart deny inventory to real buyers, and there
+is no cart expiry in scope).
+
+**Options considered:**
+- Reserve inventory on add (decrement now, restore on remove / expiry).
+- Soft check only: compare requested quantity to current stock, 409 on failure,
+  but change no inventory.
+- No check at add-time; surface everything at checkout.
+
+**Choice:** **Soft check.** `POST`/`PATCH` items compares the *resulting* line
+quantity against `Product.inventory` and returns
+`409 INSUFFICIENT_INVENTORY` if it exceeds it, but never touches `inventory`.
+The authoritative guarantee is the atomic conditional decrement
+(`UPDATE products SET inventory = inventory - :q WHERE id = :id AND inventory >= :q`)
+inside the checkout transaction (a later module).
+
+**Why:** Gives immediate feedback for the common case (you can't add 100 of a
+thing there are 3 of) without the correctness burden and lifecycle complexity of
+reservations. Because it's advisory, a mild race here is harmless — two carts
+can both "pass" the soft check for the last unit; exactly one will win at
+checkout, which is where invariant 1 (no overselling) is actually enforced.
+
+**Consequences:** A cart can pass every add-time check and still fail checkout
+with `INSUFFICIENT_INVENTORY` — documented (§2 row 2) and the reason the same
+error code is shared by both layers. The soft check is best-effort, not a
+guarantee, and tests treat it as such.
+
+---
+
+### Decision: Cart Status as a Native Postgres Enum
+
+**Context:** `Cart.status` is `open` or `checked_out` and gates every mutation.
+A typo'd or unexpected status would silently disable the checkout-once guard.
+
+**Options considered:**
+- `VARCHAR` + application-level validation.
+- `VARCHAR` + a CHECK constraint on the allowed set.
+- A native Postgres `ENUM` type (`cart_status`).
+
+**Choice:** Native `ENUM` type `cart_status` with values `open`, `checked_out`
+(stored lowercase via SQLAlchemy `values_callable`). The Alembic migration
+creates the type on upgrade and drops it on downgrade.
+
+**Why:** The database rejects any value outside the two labels — no code path,
+migration, or manual `UPDATE` can invent a third state. Consistent with the
+project's "the database is the correctness authority" stance (cf. the CHECK
+constraints on `products`).
+
+**Consequences:** Adding a future status (e.g. `abandoned`) needs an
+`ALTER TYPE ... ADD VALUE` migration rather than a code change — an acceptable
+and deliberate cost for the safety.
+
+---
+
+### Decision: A Cart-Row Lock Serialises Cart Mutations
+
+**Context:** Concurrent `POST /carts/{id}/items` for the same product must not
+create duplicate rows or lose an increment, and no mutation may proceed against
+a cart that a concurrent checkout is turning into `checked_out`.
+
+**Options considered:**
+- Application mutex / in-process lock (rejected by house rules; wrong under
+  multiple app instances).
+- `INSERT ... ON CONFLICT (cart_id, product_id) DO UPDATE SET quantity = ... + EXCLUDED.quantity`
+  — lock-free atomic upsert.
+- `SELECT ... FOR UPDATE` on the `carts` row at the start of every mutation,
+  serialising all mutations of that cart, with the unique constraint as backstop.
+
+**Choice:** `SELECT ... FOR UPDATE` on the cart row (via
+`get_open_cart_for_update`), held for the whole request transaction, plus the
+`(cart_id, product_id)` unique constraint and `quantity > 0` CHECK as structural
+guarantees.
+
+**Why:** One lock covers everything a cart mutation needs to be correct: the
+status check can't go stale, concurrent adds of the same product serialise into
+one row + one summed quantity, and a future checkout that also takes this lock
+will naturally exclude concurrent edits. It's a database mechanism, so it stays
+correct across app instances. The upsert alternative handles the duplicate-row
+case elegantly but doesn't help the status-stability or future-checkout
+concerns, so a single consistent mechanism was preferred. A regression test
+fires 15 genuinely parallel adds and asserts one row with the summed quantity;
+with the lock removed it fails with a unique-constraint violation.
+
+**Consequences:** Mutations on the *same* cart serialise (fine — a single cart is
+not a contention hotspot); different carts are unaffected. The lock is a plain
+`FOR UPDATE`, not `SKIP LOCKED` / `NOWAIT`, so a slow mutation briefly queues
+others on that cart.
 
 ---
 
@@ -397,7 +529,8 @@ _e.g.:_
 |------|-------------|---------|
 | `VALIDATION_ERROR` | 422 | Malformed or invalid request body |
 | `NOT_FOUND` | 404 | Cart/product/order/coupon does not exist |
-| `CART_ALREADY_CHECKED_OUT` | 409 | Checkout attempted on a closed cart |
+| `CONFLICT` | 409 | Generic state conflict (base for the specific 409s below) |
+| `CART_ALREADY_CHECKED_OUT` | 409 | Mutation attempted on a checked-out cart |
 | `INSUFFICIENT_INVENTORY` | 409 | Requested quantity exceeds availability |
 | `INVALID_COUPON` | 422 | Coupon code doesn't exist or isn't eligible |
 | `COUPON_ALREADY_REDEEMED` | 409 | Coupon was already spent |
@@ -420,6 +553,18 @@ _e.g.:_
   404 envelope on miss). Shared error-envelope infrastructure
   (`app/core/errors.py`: `AppError`/`NotFoundError`/`ValidationError` +
   handlers) was built here as the first consumer.
+- **Carts module.** `Cart` (native `cart_status` enum) and `CartItem`
+  (unique `(cart_id, product_id)`, `quantity > 0` CHECK, `ON DELETE CASCADE`
+  from cart / `RESTRICT` to product, no price column). `POST /carts`,
+  `GET /carts/{id}` with live-computed line subtotals + total, and
+  `POST`/`PATCH`/`DELETE` on `/carts/{id}/items` — re-adding a product
+  increments quantity, `PATCH` to quantity 0 removes, every mutation takes a
+  `SELECT ... FOR UPDATE` lock on the cart row and rejects a checked-out cart
+  with `409 CART_ALREADY_CHECKED_OUT`. Soft add-time inventory check
+  (`409 INSUFFICIENT_INVENTORY`). `ConflictError` + `CartAlreadyCheckedOutError`
+  / `InsufficientInventoryError` added to `app/core/errors.py`. Tests include a
+  15-way genuinely-concurrent add asserting no lost updates or duplicate rows.
+  Checkout itself is **not** part of this module.
 - _e.g. Full checkout transaction with idempotency, inventory locking,
   coupon redemption, order snapshotting._
 - _e.g. Admin coupon generation with milestone uniqueness constraint._
