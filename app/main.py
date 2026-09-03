@@ -7,6 +7,7 @@ from app.api.router import api_router
 from app.core.config import settings
 from app.core.errors import register_exception_handlers
 from app.db.session import get_session
+from app.features.admin.router import router as admin_router
 from app.features.carts.router import router as carts_router
 from app.features.orders.router import router as orders_router
 from app.features.products.router import router as products_router
@@ -19,6 +20,7 @@ app.include_router(api_router)
 app.include_router(products_router)
 app.include_router(carts_router)
 app.include_router(orders_router)
+app.include_router(admin_router)
 
 
 @app.get("/health")
