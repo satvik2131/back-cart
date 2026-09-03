@@ -8,12 +8,12 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    # Mount source for live-reload during development.
+    # Mount the whole project for live-reload during development. Code and
+    # config edits on the host take effect immediately — no rebuild/restart.
+    # (Changing requirements*.txt still needs `docker compose up --build`.)
     volumes:
-      - ./app:/app/app
-      - ./alembic:/app/alembic
-      - ./tests:/app/tests
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      - .:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app
 
   db:
     image: postgres:16
