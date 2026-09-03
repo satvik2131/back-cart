@@ -320,3 +320,64 @@ Do not introduce a different organizational pattern without flagging it first.
 - A function that can fail in an expected business way raises a specific domain
   exception (or returns a Result-like value) — it never overloads `None` to mean
   both "failed" and "legitimately empty".
+
+---
+
+## Frontend Rules
+
+Applies once a `frontend/` directory exists.
+
+The frontend is a **small demo React app** whose only job is to visibly prove
+the backend works end to end — per the spec, "keep it small, use it to
+demonstrate backend behavior." It is deliberately not a polished product. Small,
+but built with real engineering discipline:
+
+### Performance
+
+- **Non-negotiable.** The backend is fast and correct; the frontend must never
+  make it *look* slow. Every network call shows an immediate loading state
+  (skeleton or spinner) the instant it fires — never a blank screen or a frozen
+  button while a response is pending.
+- No unnecessary re-renders: derive state, don't duplicate it. Memoize expensive
+  computations (`useMemo`) and stable callbacks (`useCallback`) only where it
+  actually matters (list rendering, derived totals) — don't over-memoize trivial
+  values.
+- No polling and no unnecessary requests. Refetch data only when an action
+  actually changed it (re-fetch the cart after a mutation; do **not** re-fetch
+  on every keystroke).
+
+### Accuracy over illusion
+
+- **No optimistic UI.** The app's purpose is to show real backend responses,
+  including real errors and real latency. Never fake instant success and
+  reconcile later.
+- Every button that triggers a network call is **disabled while that call is in
+  flight**, to prevent duplicate submissions. The checkout button must visibly
+  demonstrate the backend's idempotency-key handling (a fresh key per new
+  attempt; the *same* key when the user retries after a failure — surfaced in
+  the UI).
+- Every API error is shown to the user using the backend's **actual structured
+  `code` and `message`** — never a generic "Something went wrong."
+
+### Structure
+
+- One component = one clear responsibility. No single file mixing API calls,
+  business logic, and rendering for multiple unrelated features.
+- A shared `api/` layer handles all fetch calls with one wrapper that parses the
+  `{"error": {code, message, details}}` envelope consistently — components never
+  call `fetch()` directly.
+
+### Dependencies (consistent with Dependency & Scope Rules above)
+
+- No CSS framework, no component library, no client-side routing library — plain
+  CSS (or CSS modules) and functional components only.
+- No global state-management library (Redux/Zustand/etc.) — React's built-in
+  state/context is sufficient at this scale; anything more is over-engineering.
+- TypeScript is preferred if the scaffold supports it with minimal setup cost;
+  otherwise document prop and API-response shapes with JSDoc.
+- Vite as the build tool (fast dev server, minimal config).
+
+### Out of scope
+
+Authentication, animations/transitions, a design system, routing, and frontend
+tests (the backend tests are what matter) — do not add them.
