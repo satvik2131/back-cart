@@ -571,6 +571,14 @@ _e.g.:_
 - _e.g. Admin report as a live aggregate query._
 
 **Intentionally deferred (with reasoning):**
+- **Structured log events on mutations.** The house rules call for a structured
+  log event on every mutating operation (cart mutation, checkout, coupon
+  generation) with the correlation/idempotency key. No logging infrastructure
+  exists in `app/core` yet, and doing it properly (JSON formatter, request-id
+  middleware, uvicorn log config) is its own slice of work. Deferred to a
+  dedicated step so it lands once, consistently, across carts + checkout +
+  coupons rather than ad hoc per module. The carts endpoints are otherwise
+  observable via the error envelope + HTTP status.
 - _e.g. Multi-instance distributed locking beyond what Postgres provides
   natively — deferred because a single-instance deployment with DB-level
   transactions satisfies the stated invariants; see Section 8 for how this
