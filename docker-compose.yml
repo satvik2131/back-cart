@@ -3,8 +3,15 @@ services:
     build: .
     ports:
       - "8000:8000"
-    env_file:
-      - .env
+    # All settings have working defaults baked in here — no .env file is
+    # required. Create one only if you want to override a value; if present,
+    # Compose merges it in automatically (docker compose reads ./.env itself).
+    environment:
+      APP_ENV: ${APP_ENV:-development}
+      APP_NAME: ${APP_NAME:-back-cart}
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://postgres:postgres@db:5432/back_cart}
+      COUPON_MILESTONE_EVERY: ${COUPON_MILESTONE_EVERY:-5}
+      COUPON_DISCOUNT_PERCENT: ${COUPON_DISCOUNT_PERCENT:-10}
     depends_on:
       db:
         condition: service_healthy

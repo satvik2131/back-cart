@@ -23,11 +23,12 @@ pydantic-settings · pytest + httpx · Docker Compose
 ## Run
 
 ```bash
-cp .env.example .env
 docker compose up --build
 ```
 
-That's the only manual step. It starts three services:
+That's it — no `.env` file, no manual migration, no manual seed step. All
+config has working defaults baked into `docker-compose.yml`. It starts three
+services:
 
 | Service | URL | Notes |
 | --- | --- | --- |
@@ -72,7 +73,7 @@ tagged `admin` in the OpenAPI docs.
 ### A full demo flow
 
 ```bash
-cp .env.example .env && docker compose up --build -d && sleep 8
+docker compose up --build -d && sleep 8
 
 BASE=localhost:8000
 PID=$(curl -s $BASE/products | python3 -c "import sys,json;print(next(p['id'] for p in json.load(sys.stdin) if p['inventory']>10))")

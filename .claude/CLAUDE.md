@@ -142,8 +142,7 @@ correcting or rejecting AI output — capture those when they happen.
 ## Running the project
 
 ```bash
-cp .env.example .env          # first time only
-docker compose up --build     # API on http://localhost:8000
+docker compose up --build     # API on http://localhost:8000 — no .env needed, all config defaults are baked into docker-compose.yml
 ```
 
 Health checks:
