@@ -80,10 +80,10 @@ reason.
 | 4 | Is a coupon single-use globally or single-use per customer? | **Single-use globally** (no customer identity in scope). First successful checkout to win the `WHERE status='available'` race consumes it; `code` is UNIQUE. |
 | 5 | Does a milestone count all created orders or only successful ones? | **Only `orders` rows with `status='success'`.** A failed checkout rolls back and writes no order, so "created" and "successful" coincide here — but the report and milestone query both filter on `status='success'` explicitly. |
 | 6 | What is the idempotency key — client-supplied header, or derived from cart state? | **Client-supplied `Idempotency-Key` HTTP header**, required (missing → 422). The full response body + status are stored keyed by it; a replay returns them verbatim. See §3 "Idempotency Strategy for Checkout". |
-| 9 | What is the coupon milestone cadence and discount size? | Config: `COUPON_MILESTONE_EVERY` (default 5) and `COUPON_DISCOUNT_PERCENT` (default 10). Milestones are `n, 2n, 3n, …`; `generate` always targets the latest one reached. |
-| 10 | Does the test suite run against the app database? | **No.** The suite provisions a separate `<db>_test` database (schema from ORM metadata) so it never mutates dev data. Override with `TEST_DATABASE_URL`. |
 | 7 | Can an item quantity of 0 be added, or must it be removed instead? | **Quantity must be ≥ 1 on `POST /carts/{id}/items`** (rejected 422 otherwise, enforced by both the Pydantic schema and a `quantity > 0` DB CHECK). On `PATCH .../items/{item_id}`, **quantity 0 means remove** the line; negative is 422. |
 | 8 | `product_id` that is malformed vs. well-formed but unknown when adding an item. | Malformed (not a UUID) → **422 `VALIDATION_ERROR`** (schema). Well-formed but no such product → **404 `NOT_FOUND`**. Both are rejected; neither is silently accepted. |
+| 9 | What is the coupon milestone cadence and discount size? | Config: `COUPON_MILESTONE_EVERY` (default 5) and `COUPON_DISCOUNT_PERCENT` (default 10). Milestones are `n, 2n, 3n, …`; `generate` always targets the latest one reached. |
+| 10 | Does the test suite run against the app database? | **No.** The suite provisions a separate `<db>_test` database (schema from ORM metadata) so it never mutates dev data. Override with `TEST_DATABASE_URL`. |
 
 _Add rows for anything else you had to decide unilaterally._
 
@@ -280,16 +280,31 @@ not just by HTTP status code.
   plus a human message.
 - RFC 7807 Problem Details.
 
-**Choice:** _State your pick._
+**Choice:** A structured error envelope,
+`{"error": {"code": "STABLE_CODE", "message": "...", "details": {...}}}`,
+returned by every error path — business rule failures raised as `AppError`
+subclasses *and* framework-raised errors (unmatched route, wrong method,
+unhandled exception) — via shared handlers registered once in
+`app/core/errors.py` (`register_exception_handlers`). Never RFC 7807, never a
+bare HTTP status with free text.
 
-**Why:** _e.g. A structured `{"error": {"code": "INSUFFICIENT_INVENTORY",
-"message": "...", "details": {...}}}` envelope lets clients branch on
-`code` without parsing message text, while still mapping cleanly onto HTTP
-status codes (409 for conflicts, 422 for validation, 404 for not found)._
+**Why:** `code` is what a client branches on programmatically (`if code ==
+"INSUFFICIENT_INVENTORY"`); `message` is for a human/log line; `details` carries
+structured context (`requested`/`available`, the offending `product_id`, …)
+without overloading the message string. RFC 7807 was considered and rejected —
+its `type`/`title`/`instance` fields add ceremony this API doesn't need, and a
+flat `code` is simpler for a client to switch on than a URI. Centralizing in
+one handler set (rather than `raise HTTPException` scattered through routes)
+is what makes "every error response has this shape, no exceptions" actually
+true instead of aspirational — verified by hitting an unmatched route, a wrong
+method, and a malformed UUID and confirming all three come back enveloped.
 
-**Consequences:** _e.g. Every error path in the codebase must produce this
-shape consistently — worth a shared exception-handling middleware rather
-than ad hoc `raise HTTPException` calls scattered through handlers._
+**Consequences:** New business errors are a two-line `AppError` subclass with a
+`code` and status, not a new inline `HTTPException`. Status codes are still
+meaningful (409 conflict, 422 validation, 404 not found, 500 internal) so the
+envelope complements HTTP semantics rather than hiding them. The full code
+catalogue is DECISIONS.md §6, and it's the contract clients (including this
+project's own frontend `ApiError`) are written against.
 
 ---
 
@@ -303,20 +318,36 @@ concurrency-safety work is "free" versus hand-built.
 - Embedded DB (SQLite) with transactions.
 - Full RDBMS (Postgres) with transactions and row-level locking.
 
-**Choice:** _State your pick._
+**Choice:** Full Postgres, via SQLAlchemy 2 async + asyncpg, for every
+invariant in this system — no in-memory state is ever load-bearing for
+correctness.
 
-**Why:** _Explain why you leaned on the database's own transactional
-guarantees instead of reimplementing them — usually the stronger, more
-defensible choice given the timebox, since it removes an entire class of
-hand-rolled concurrency bugs._
+**Why:** Every hard invariant here (no oversell, at-most-once checkout, at-most
+-once coupon generation/redemption) is fundamentally a concurrency-control
+problem, and Postgres already solves that class of problem — row locks,
+`SELECT ... FOR UPDATE`, unique constraints, atomic conditional `UPDATE`,
+CHECK constraints — correctly and under real contention. An in-memory store
+would require hand-rolling equivalents (`asyncio.Lock` per cart/product/coupon,
+manual rollback-on-failure bookkeeping) that are easy to get subtly wrong and,
+per the spec, *still* wouldn't demonstrate multi-instance correctness, since
+in-process locks don't cross processes. SQLite was rejected specifically for
+that last reason: it's a legitimate embedded option but its single-writer model
+means the "how would this look with multiple instances" question has no honest
+answer. Choosing Postgres from the start means every concurrency test in this
+suite is exercising the same primitives that would run in production, not a
+stand-in.
 
-**Consequences:** _e.g. Requires Docker/Postgres to run instead of "clone
-and go"; in exchange, correctness under concurrency is largely inherited
-from the DB rather than something you have to independently prove correct._
+**Consequences:** Requires Docker/Postgres to run instead of "clone and go" —
+mitigated here by `docker compose up --build` doing everything (migrate, seed,
+serve) in one command. In exchange, correctness under concurrency is inherited
+from the database's own guarantees rather than something hand-built and
+independently proven; the trade-off actively shows up in this codebase — there
+is no mutex or in-memory cache anywhere in `app/`.
 
-_(Add a sixth+ decision if you have one — payment abstraction, cart vs.
-order boundary, report computation strategy (live query vs. materialized),
-etc.)_
+Additional material decisions — cart pricing, soft-vs-hard inventory checks,
+the coupon safety mechanism, native-enum status columns, the cart-row lock, the
+checkout transaction boundary, the test database — are recorded further down as
+they arose, each in the same Context/Options/Choice/Why/Consequences form.
 
 ---
 
