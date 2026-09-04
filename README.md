@@ -27,19 +27,24 @@ cp .env.example .env
 docker compose up --build
 ```
 
-That's the only manual step. On start the `api` container runs
-`alembic upgrade head`, seeds the product catalogue (both idempotent), then
-serves on **http://localhost:8000**.
+That's the only manual step. It starts three services:
+
+| Service | URL | Notes |
+| --- | --- | --- |
+| `api` | http://localhost:8000 | runs `alembic upgrade head` + seed (idempotent) on start, then uvicorn |
+| `frontend` | http://localhost:5173 | Vite dev server for the demo UI (first build installs npm deps) |
+| `db` | `localhost:5434` | PostgreSQL 16 |
 
 ```bash
 curl localhost:8000/health         # {"status":"ok"}
 curl localhost:8000/health/db      # {"status":"ok","db":"connected"}
 ```
 
-Interactive API docs: **http://localhost:8000/docs**
+Interactive API docs: **http://localhost:8000/docs** · Demo UI: **http://localhost:5173**
 
 > Postgres publishes on host port **5434** (to avoid clashing with a local
-> Postgres on 5432); inside the compose network it's `db:5432`.
+> Postgres on 5432); inside the compose network it's `db:5432`, and the
+> frontend reaches the API as `api:8000`.
 
 ## API overview
 
@@ -113,14 +118,17 @@ clean up after themselves. At least one concurrency test per critical path
 (oversell, idempotent-retry race, concurrent coupon generation, concurrent
 coupon redemption), each verified to fail when its DB-level guard is removed.
 
-## Frontend demo (optional)
+## Frontend demo
 
 A small React + Vite app under [`frontend/`](frontend/) drives the whole flow
 from a browser (products → cart → checkout → idempotent retry → coupons →
-report), showing real backend responses and errors. With the API running:
+report), showing real backend responses and errors. It comes up with
+`docker compose up` at **http://localhost:5173**.
+
+To run it outside Docker instead (against the compose API):
 
 ```bash
-cd frontend && npm install && npm run dev   # http://localhost:5173
+cd frontend && npm install && npm run dev
 ```
 
 See [`frontend/README.md`](frontend/README.md).

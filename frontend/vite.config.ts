@@ -11,7 +11,10 @@ export default defineConfig(({ mode }) => {
   return {
     plugins: [react()],
     server: {
+      host: true, // reachable from outside the container
       port: 5173,
+      // Bind-mounted source on Docker Desktop doesn't deliver fs events.
+      watch: env.VITE_USE_POLLING ? { usePolling: true } : undefined,
       proxy: {
         "/api": {
           target: apiTarget,

@@ -6,23 +6,22 @@ see the "Frontend Rules" section of [`../.claude/CLAUDE.md`](../.claude/CLAUDE.m
 
 ## Run
 
-The backend must already be running:
+### With docker compose (default)
 
-```bash
-cd ..
-cp .env.example .env
-docker compose up --build      # API on http://localhost:8000
-```
+From the repo root, `docker compose up --build` starts this app alongside the
+API and database — open **http://localhost:5173**. It runs the Vite dev server
+with the source mounted (live reload) and proxies `/api/*` to the `api` service.
+The first build installs npm dependencies into the image.
 
-Then, in this directory:
+### Standalone (against the compose API)
 
 ```bash
 npm install
 npm run dev                     # http://localhost:5173
 ```
 
-The dev server proxies `/api/*` to `http://localhost:8000`, so no CORS setup is
-needed on the API. Point it elsewhere with `VITE_API_TARGET` (proxy) or
+The dev server proxies `/api/*` to `http://localhost:8000` by default, so the
+API needs no CORS. Override with `VITE_API_TARGET` (proxy target) or
 `VITE_API_BASE` (client base URL).
 
 ```bash

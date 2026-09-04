@@ -21,6 +21,23 @@ services:
              python -m app.features.products.seed &&
              uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir /app"
 
+  # Small React demo UI (Vite dev server), same dev-mode approach as `api`.
+  # It reaches the backend over the compose network as `api:8000`
+  # (VITE_API_TARGET), so the API still needs no CORS. Source is mounted for
+  # live reload; deps come from the image (see frontend/Dockerfile).
+  frontend:
+    build: ./frontend
+    environment:
+      VITE_API_TARGET: http://api:8000
+      VITE_USE_POLLING: "1"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - api
+
   db:
     image: postgres:16
     environment:
